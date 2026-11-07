@@ -36,7 +36,7 @@ param(
     [switch]$ReadOnly
 )
 
-$script:PssVersion = '1.2.0'
+$script:PssVersion = '1.2.1'
 $script:PssUrl     = 'https://raw.githubusercontent.com/joshpack/PaxStartupScanner/main/PaxStartupScanner.ps1'
 $script:PssSelfPath = $PSCommandPath   # empty when run through irm | iex
 
@@ -2798,17 +2798,37 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
             $ui.BtCompare.Text = ((Compare-PssBootTests $old $new) | ForEach-Object { $_.Text }) -join "`r`n"
         })
 
-    # ---- right-click a row to filter by it ----
+    # ---- right-click a row: every button from the details pane, then quick filters ----
     $cm = New-Object Windows.Controls.ContextMenu
     $mkItem = {
         param([string]$Text, [scriptblock]$Do)
         $mi = New-Object Windows.Controls.MenuItem; $mi.Header = $Text; $mi.Add_Click($Do); [void]$cm.Items.Add($mi)
+        return $mi
     }
-    & $mkItem 'Show only this publisher' { $it = & $sel; if ($it) { $state.Filter['Publisher'] = $it.Vendor; & $applyFilter } }
-    & $mkItem 'Show only this category' { $it = & $sel; if ($it) { $state.Filter['Category'] = $it.Category; & $applyFilter } }
-    & $mkItem 'Show only items that are on' { $state.Filter['Status'] = 'On'; & $applyFilter }
-    & $mkItem 'Show only flagged items' { $state.Filter['Risk'] = 'Flagged'; & $applyFilter }
-    & $mkItem 'Clear filters' { & $clearFilters }
+    # each item presses the matching button, so menu and buttons always behave the same
+    $press = { param($btn) $btn.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent))) }
+    $null = & $mkItem 'Open location' { & $press $ui.BtnLoc }
+    $null = & $mkItem 'Show file in Explorer' { & $press $ui.BtnFile }
+    $null = & $mkItem 'Look up on VirusTotal' { & $press $ui.BtnVt }
+    $null = & $mkItem 'Search the web' { & $press $ui.BtnWeb }
+    $null = & $mkItem 'Copy details' { & $press $ui.BtnCopy }
+    [void]$cm.Items.Add((New-Object Windows.Controls.Separator))
+    $state.MiToggle = & $mkItem 'Disable' { & $press $ui.BtnToggle }
+    $state.MiDelete = & $mkItem 'Delete...' { & $press $ui.BtnDelete }
+    [void]$cm.Items.Add((New-Object Windows.Controls.Separator))
+    $cm.Add_Opened({
+            # mirror the buttons: same label, same enabled state, same reason when greyed out
+            $state.MiToggle.Header = $ui.BtnToggle.Content
+            $state.MiToggle.IsEnabled = $ui.BtnToggle.IsEnabled
+            $state.MiDelete.IsEnabled = $ui.BtnDelete.IsEnabled
+            foreach ($m in $state.MiToggle, $state.MiDelete) { [Windows.Controls.ToolTipService]::SetShowOnDisabled($m, $true) }
+            $state.MiToggle.ToolTip = $ui.BtnToggle.ToolTip; $state.MiDelete.ToolTip = $ui.BtnDelete.ToolTip
+        })
+    $null = & $mkItem 'Show only this publisher' { $it = & $sel; if ($it) { $state.Filter['Publisher'] = $it.Vendor; & $applyFilter } }
+    $null = & $mkItem 'Show only this category' { $it = & $sel; if ($it) { $state.Filter['Category'] = $it.Category; & $applyFilter } }
+    $null = & $mkItem 'Show only items that are on' { $state.Filter['Status'] = 'On'; & $applyFilter }
+    $null = & $mkItem 'Show only flagged items' { $state.Filter['Risk'] = 'Flagged'; & $applyFilter }
+    $null = & $mkItem 'Clear filters' { & $clearFilters }
     $ui.Grid.ContextMenu = $cm
 
     $load = {

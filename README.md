@@ -109,7 +109,7 @@ Click any entry to narrow the list. Filters combine, and each list's counts upda
 
 Other ways to narrow things down:
 - **Search box and "Hide clean Microsoft items":** work together with the sidebar.
-- **Right-click a row:** "Show only this publisher", "Show only this category", "Show only items that are on", "Show only flagged items".
+- **Right-click a row:** every button from the details pane (Open location, Show file, VirusTotal, Search web, Copy details, Disable/Enable, Delete), plus "Show only this publisher", "Show only this category", "Show only items that are on", "Show only flagged items".
 - **Clear filters:** resets everything.
 - **Export report:** saves all items, or only the ones currently shown.
 
