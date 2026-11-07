@@ -52,7 +52,18 @@ function New-Sample {
     $it.Impact = if ($Delay -ge 3000 -or $Mem -ge 400) { 'High' } elseif ($Delay -ge 1000 -or $Mem -ge 150) { 'Medium' } elseif ($Mem -or $Delay) { 'Low' } else { '' }
     Measure-PssRisk $it
     Set-PssPermissions $it
+    Set-PssFacets $it
 }
+# Sample timed restarts for the Boot tests tab
+function Get-PssBootTests {
+    $mk = { param($when, $label, $b, $s, $procs, $top) [pscustomobject]@{ Id = $when; Boot = [datetime]$when; When = ([datetime]$when).ToString('yyyy-MM-dd HH:mm'); Label = $label; BootToIdleSec = $b; SignInToIdleSec = $s; TotalSec = $b + $s; BootText = (Format-PssSec $b); SignInText = (Format-PssSec $s); TotalText = (Format-PssSec ($b + $s)); SignedInFirst = $false; ProcessesStarted = $procs; TopProcesses = $top; Notes = '' } }
+    @(
+        (& $mk $now.AddHours(-1).ToString('yyyy-MM-dd HH:mm') 'After changes' 38.4 27.9 41 @([pscustomobject]@{ Name = 'OneDrive.exe'; CpuSec = 6.0 }, [pscustomobject]@{ Name = 'Steam.exe'; CpuSec = 4.1 }))
+        (& $mk $now.AddHours(-3).ToString('yyyy-MM-dd HH:mm') 'Before changes' 41.2 70.3 64 @([pscustomobject]@{ Name = 'Discord.exe'; CpuSec = 22.1 }, [pscustomobject]@{ Name = 'svchost.exe'; CpuSec = 14.0 }, [pscustomobject]@{ Name = 'Steam.exe'; CpuSec = 12.4 }))
+    )
+}
+function Get-PssChangeHistory { @([pscustomobject]@{ Time = $now.AddHours(-2); Action = 'Disable'; Category = 'Run Key'; Name = 'Discord'; Undone = $false }, [pscustomobject]@{ Time = $now.AddHours(-2).AddMinutes(1); Action = 'Delete'; Category = 'Scheduled Task'; Name = '\OneDrive Sync Task'; Undone = $false }) }
+function Get-PssBootTestState { $null }
 # Sample undo history for the Undo tab screenshot (the real list reads %ProgramData%\PaxStartupScanner\Backups)
 function Get-PssUndoRecords {
     @(
@@ -173,5 +184,6 @@ Show-PssBoot $scan
 Save-Console (Join-Path $OutDir 'console-boot.png') $title
 # 5) GUI, startup items tab and Undo tab
 [void](Show-PssGui $scan -Snapshot (Join-Path $OutDir 'gui.png'))
-[void](Show-PssGui $scan -Snapshot (Join-Path $OutDir 'gui-undo.png') -SnapshotTab 2)
+[void](Show-PssGui $scan -Snapshot (Join-Path $OutDir 'gui-boot-tests.png') -SnapshotTab 1)
+[void](Show-PssGui $scan -Snapshot (Join-Path $OutDir 'gui-undo.png') -SnapshotTab 3)
 Get-ChildItem $OutDir -Filter *.png | ForEach-Object { '{0}  {1:N0} KB' -f $_.Name, ($_.Length / 1KB) }

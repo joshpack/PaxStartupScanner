@@ -24,15 +24,19 @@
     Non-interactive: scan, print the summary and flagged items, then return.
 .PARAMETER Export
     Write a report to this path (.html, .csv or .json) after scanning.
+.PARAMETER ReadOnly
+    Look only: nothing on the PC is written or changed (no Disable/Delete/Undo, boot tests,
+    restarts, exports or Regedit jump). Also turned on by $env:PSS_READONLY = '1', which works with irm | iex.
 #>
 [CmdletBinding()]
 param(
     [switch]$Gui,
     [switch]$Report,
-    [string]$Export
+    [string]$Export,
+    [switch]$ReadOnly
 )
 
-$script:PssVersion = '1.1.0'
+$script:PssVersion = '1.2.0'
 $script:PssUrl     = 'https://raw.githubusercontent.com/joshpack/PaxStartupScanner/main/PaxStartupScanner.ps1'
 $script:PssSelfPath = $PSCommandPath   # empty when run through irm | iex
 
@@ -222,6 +226,7 @@ function Add-PssItem {
         BootDelayMs = 0; BootDelayCount = 0; BootDelayText = ''; BootDelayLast = $null; Impact = ''
         Flags = ''; FlagList = @(); Sha256 = ''
         Op = $Op; State = ''; CanDisable = $false; CanDelete = $false; ActionNote = ''
+        Vendor = ''; SigGroup = ''; Scope = ''
     }
     $script:PssItems.Add($it)
 }
@@ -818,6 +823,11 @@ function Measure-PssRisk($it) {
         'Boot Execute' { if ($it.Kind -eq 'Modified') { $flags.Add('Non-default boot execute'); $score += 4 } }
         'Run Key' { if ($it.Name -match '^Windows\\(Load|Run)$') { $flags.Add('Legacy load point'); $score += 3 } }
     }
+    # The scanner's own boot-test tasks (hidden PowerShell running a script in ProgramData would otherwise be flagged)
+    if ($it.Category -eq 'Scheduled Task' -and $it.Name -like '\PAX Startup Scanner\*' -and $cmd -match '(?i)\\PaxStartupScanner\\boot-probe\.ps1') {
+        $flags.Clear(); $score = 0
+        $it.Extra = 'PAX Startup Scanner boot test. It runs once at the next restart and then removes itself.'
+    }
     $it.FlagList = @($flags)
     $it.Flags = ($flags -join '; ')
     $it.RiskScore = $score
@@ -926,6 +936,7 @@ function Invoke-PssScan {
         $it.Impact = if ($it.BootDelayMs -ge 3000 -or $it.MemoryMB -ge 400) { 'High' } elseif ($it.BootDelayMs -ge 1000 -or $it.MemoryMB -ge 150 -or $it.CpuSec -ge 600) { 'Medium' } elseif ($it.Running -or $it.BootDelayMs) { 'Low' } else { '' }
         Measure-PssRisk $it
         Set-PssPermissions $it
+        Set-PssFacets $it
     }
     $rank = @{ High = 0; Medium = 1; Low = 2; OK = 3 }
     $sorted = @($items | Sort-Object @{ E = { $rank[$_.Risk] } }, @{ E = { $_.IsMicrosoft } }, Category, Name)
@@ -1030,6 +1041,13 @@ function Get-PssHash($it) {
 function Open-PssLocation($it) {
     if ($it.RegKey) {
         $full = $it.RegKey -replace '^HKLM\\', 'HKEY_LOCAL_MACHINE\' -replace '^HKU\\', 'HKEY_USERS\'
+        if ($script:PssReadOnly) {
+            # Jumping Regedit to a key means writing its LastKey setting; read-only mode copies the path instead
+            try { Set-Clipboard -Value "Computer\$full" } catch {}
+            $script:PssLastNote = 'Read-only mode: the registry path was copied to the clipboard (paste it into Regedit''s address bar).'
+            Start-Process regedit.exe -ArgumentList '/m'
+            return
+        }
         try {
             $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Software\Microsoft\Windows\CurrentVersion\Applets\Regedit')
             $k.SetValue('LastKey', "Computer\$full"); $k.Close()
@@ -1056,12 +1074,13 @@ function Open-PssVirusTotal($it) {
     return $false
 }
 
-function Export-PssReport($Scan, [string]$Path) {
+function Export-PssReport($Scan, [string]$Path, [string]$Note = '') {
+    # $Note describes a filtered export ("Showing 12 of 507 items - Publisher: ...")
     $ext = [IO.Path]::GetExtension($Path).ToLowerInvariant()
-    $cols = 'Id', 'Risk', 'RiskScore', 'Category', 'Name', 'EnabledText', 'User', 'Trigger', 'Command', 'ImagePath', 'Publisher', 'SignStatus', 'Description', 'Version', 'FileExists', 'Created', 'Modified', 'Location', 'ValueName', 'Running', 'MemoryMB', 'BootDelayMs', 'Impact', 'IsMicrosoft', 'Flags', 'Extra'
+    $cols = 'Id', 'Risk', 'RiskScore', 'Category', 'Name', 'EnabledText', 'User', 'Scope', 'Trigger', 'Command', 'ImagePath', 'Publisher', 'Vendor', 'SignStatus', 'Description', 'Version', 'FileExists', 'Created', 'Modified', 'Location', 'ValueName', 'Running', 'MemoryMB', 'BootDelayMs', 'Impact', 'IsMicrosoft', 'Flags', 'Extra'
     if ($ext -eq '.csv') { $Scan.Items | Select-Object $cols | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8; return }
     if ($ext -eq '.json') {
-        [pscustomobject]@{ Computer = $Scan.Computer; OS = $Scan.OS; ScannedAt = $Scan.ScannedAt; Admin = $Scan.IsAdmin; Items = @($Scan.Items | Select-Object $cols); Boots = $Scan.Boot.Boots; BootDelays = $Scan.Boot.Delays } |
+        [pscustomobject]@{ Computer = $Scan.Computer; OS = $Scan.OS; ScannedAt = $Scan.ScannedAt; Admin = $Scan.IsAdmin; Filter = $Note; Items = @($Scan.Items | Select-Object $cols); Boots = $Scan.Boot.Boots; BootDelays = $Scan.Boot.Delays } |
             ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Path -Encoding UTF8
         return
     }
@@ -1086,6 +1105,7 @@ tr.ms{opacity:.6}.bar{display:flex;gap:12px;align-items:center;margin:8px 0;flex
 </style></head><body><main>
 <h1>PAX Startup Scanner report</h1>
 <div class="mut">$(& $e $Scan.Computer) &middot; $(& $e $Scan.OS) &middot; scanned $('{0:yyyy-MM-dd HH:mm}' -f $Scan.ScannedAt) &middot; elevated: $(if ($Scan.IsAdmin) { 'yes' } else { 'no' }) &middot; v$($Scan.Version)</div>
+$(if ($Note) { "<div class=`"mut`">Filtered view: $(& $e $Note)</div>" })
 <div class="tiles">
 <div class="t"><b>$($items.Count)</b>startup items</div>
 <div class="t"><b>$(@($items | Where-Object { -not $_.IsMicrosoft }).Count)</b>third-party</div>
@@ -1132,6 +1152,35 @@ q.oninput=f;ms.onchange=f;f();
 #  anything is touched; the record is removed again if the change fails.
 # ======================================================================================
 
+function Set-PssFacets($it) {
+    # The values the GUI filters and the console browse lists group by
+    $it.Vendor = if ($it.IsMicrosoft) { 'Microsoft' } elseif ($it.Publisher) { [string]$it.Publisher } else { '(no file)' }
+    $it.SigGroup = if ($it.NoImage) { 'No file to check' }
+    elseif ($it.ImagePath -match '(?i)\\Microsoft\\WindowsApps\\') { "Couldn't check" }
+    elseif (-not $it.FileExists) { 'File missing' }
+    else {
+        switch ($it.SignStatus) { 'Valid' { 'Signed' } 'NotSigned' { 'Unsigned' } { $_ -in 'Error', 'UnknownError', '' } { "Couldn't check" } default { 'Bad signature' } }
+    }
+    $scope = 'Machine (all users)'
+    if ($it.RegKey -like 'HKU\*' -or ($it.Category -eq 'Startup Folder' -and $it.User -and $it.User -ne 'All users')) {
+        $u = [string]$it.User; if ($u -match '\\') { $u = $u.Split('\')[-1] }
+        if ($u) { $scope = "User: $u" }
+    }
+    $it.Scope = $scope
+}
+
+function Get-PssFacetKeys($it) {
+    return @{
+        Status    = $(if ($it.State -eq 'Removed') { 'Removed' } elseif ($it.Enabled) { 'On' } else { 'Off' })
+        Risk      = $it.Risk
+        Category  = $it.Category
+        Publisher = $it.Vendor
+        Signature = $it.SigGroup
+        Running   = $(if ($it.Running) { 'Running now' } else { 'Not running' })
+        Scope     = $it.Scope
+    }
+}
+
 function Set-PssPermissions($it) {
     # Decides what may be changed. Windows' own parts are protected; user-level autostarts are not.
     $it.CanDisable = $false; $it.CanDelete = $false; $it.ActionNote = ''
@@ -1139,6 +1188,7 @@ function Set-PssPermissions($it) {
     if ($it.State -eq 'Removed') { $it.ActionNote = 'Removed in this session. Undo can bring it back.'; return }
     if (-not $op) { $it.ActionNote = "This entry can't be changed from here."; return }
     if ($op.Type -eq 'Blocked') { $it.ActionNote = $op.Note; return }
+    if ($script:PssReadOnly) { $it.ActionNote = 'Read-only mode: nothing on this PC is changed.'; return }
     $cleanMs = $it.IsMicrosoft -and $it.Risk -eq 'OK'
     switch ($it.Category) {
         { $_ -in 'Run Key', 'RunOnce', 'Policy Run' } { $it.CanDelete = $true; $it.CanDisable = [bool]$op.ApprovedKind; break }
@@ -1163,7 +1213,9 @@ function Set-PssPermissions($it) {
     if (-not $it.CanDisable -and -not $it.CanDelete -and -not $it.ActionNote) { $it.ActionNote = "This entry can't be changed from here." }
 }
 
-function Get-PssBackupPath { return (Join-Path $env:ProgramData 'PaxStartupScanner\Backups') }
+function Get-PssDataPath { return (Join-Path $env:ProgramData 'PaxStartupScanner') }
+
+function Get-PssBackupPath { return (Join-Path (Get-PssDataPath) 'Backups') }
 
 function Get-PssBackupDir {
     $d = Get-PssBackupPath
@@ -1487,6 +1539,7 @@ function Get-PssUndoRecords {
 
 function Invoke-PssUndo($Rec) {
     # Replays the record's backup steps in reverse, then files the record under Backups\Restored
+    if ($script:PssReadOnly) { return @{ Ok = $false; Message = 'Read-only mode: nothing on this PC is changed.' } }
     $steps = @($Rec.Steps)
     [array]::Reverse($steps)
     try {
@@ -1524,6 +1577,265 @@ function Invoke-PssUndo($Rec) {
     } catch {}
     $verb = switch ($Rec.Action) { 'Delete' { 'deletion' } 'Disable' { 'disabling' } 'Enable' { 'enabling' } default { 'change' } }
     return @{ Ok = $true; Message = "Undid the $verb of $($Rec.Name). Rescan to see it in the list again." }
+}
+
+# ======================================================================================
+#  Boot tests: time real restarts before and after changes and compare them
+#  Arming writes boot-probe.ps1 to %ProgramData%\PaxStartupScanner and registers two one-shot
+#  SYSTEM tasks (at startup, at sign-in). They record when Windows went idle at the sign-in
+#  screen and when the desktop went idle after sign-in (time spent typing the password is not
+#  counted), save the result to BootTests\, then remove the tasks and the probe.
+# ======================================================================================
+
+$script:PssProbeScript = @'
+# PAX Startup Scanner boot test probe (runs once at the next startup and sign-in, then removes itself)
+param([ValidateSet('startup', 'logon')][string]$Phase = 'logon', [string]$OutDir = '', [int]$MaxSeconds = 600, [switch]$NoDisarm, [string]$TestStart = '')
+$ErrorActionPreference = 'Continue'
+$root = Join-Path $env:ProgramData 'PaxStartupScanner'
+if (-not $OutDir) { $OutDir = Join-Path $root 'BootTests' }
+New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+$boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+$id = $boot.ToString('yyyyMMdd-HHmmss')
+$test = if ($TestStart) { [datetime]::Parse($TestStart) } else { $null }
+$label = ''
+try { $label = [string](Get-Content -LiteralPath (Join-Path $root 'boot-test.json') -Raw -ErrorAction Stop | ConvertFrom-Json).Label } catch {}
+
+function Get-Load {
+    $cpu = $null; $diskIdle = $null
+    try { $cpu = [double](@(Get-CimInstance Win32_Processor -ErrorAction Stop) | Measure-Object -Property LoadPercentage -Average).Average } catch {}
+    try { $diskIdle = [double](Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'" -ErrorAction Stop).PercentIdleTime } catch {}
+    return @{ Cpu = $cpu; DiskIdle = $diskIdle }
+}
+
+function Test-SignedIn {
+    # the user's desktop shell has started since boot
+    return [bool](Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CreationDate -gt $boot })
+}
+
+function Get-SignIn {
+    # newest real user sign-in since boot (skips the Window Manager / Font Driver Host sessions Windows creates itself)
+    $ids = @{}
+    foreach ($l in @(Get-CimInstance Win32_LoggedOnUser -ErrorAction SilentlyContinue)) {
+        if ([string]$l.Antecedent.Domain -in 'Window Manager', 'Font Driver Host') { continue }
+        $ids[[string]$l.Dependent.LogonId] = $true
+    }
+    $s = @(Get-CimInstance Win32_LogonSession -ErrorAction SilentlyContinue | Where-Object { $_.LogonType -in 2, 10, 11 -and $_.StartTime -gt $boot -and $ids.ContainsKey([string]$_.LogonId) })
+    if ($s) { return ($s | Sort-Object StartTime | Select-Object -Last 1).StartTime }
+    $shell = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CreationDate -gt $boot } | Sort-Object CreationDate | Select-Object -First 1
+    if ($shell) { return $shell.CreationDate }
+    return $null
+}
+
+function Wait-Quiet([datetime]$From, [switch]$StopAtSignIn) {
+    # the first moment the PC stayed quiet (CPU under 20%, disk mostly idle) for 10 seconds
+    $quietSince = $null
+    while (((Get-Date) - $From).TotalSeconds -lt $MaxSeconds) {
+        if ($StopAtSignIn -and (Test-SignedIn)) { return @{ Time = $null; SignedIn = $true } }
+        $l = Get-Load
+        $quiet = ($null -ne $l.Cpu -and $l.Cpu -lt 20) -and ($null -eq $l.DiskIdle -or $l.DiskIdle -ge 80)
+        if ($quiet) {
+            if (-not $quietSince) { $quietSince = Get-Date }
+            if (((Get-Date) - $quietSince).TotalSeconds -ge 10) { return @{ Time = $quietSince; SignedIn = $false } }
+        } else { $quietSince = $null }
+        Start-Sleep -Seconds 1
+    }
+    return @{ Time = $null; SignedIn = $false }
+}
+
+$rec = [ordered]@{ Version = 1; Phase = $Phase; Computer = $env:COMPUTERNAME; BootTime = $boot.ToString('o'); Label = $label; Started = (Get-Date).ToString('o') }
+if ($Phase -eq 'startup') {
+    $from = if ($test) { $test } else { $boot }
+    $r = Wait-Quiet $from -StopAtSignIn:(-not $test)
+    $rec.IdleBeforeSignIn = $(if ($r.Time) { $r.Time.ToString('o') } else { $null })
+    $rec.SignedInFirst = [bool]$r.SignedIn
+} else {
+    $signIn = if ($test) { $test } else { Get-SignIn }
+    if (-not $signIn) { $signIn = Get-Date }
+    $shell = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CreationDate -gt $boot } | Sort-Object CreationDate | Select-Object -First 1
+    $r = Wait-Quiet $signIn
+    $rec.SignIn = $signIn.ToString('o')
+    $rec.ShellStart = $(if ($shell) { $shell.CreationDate.ToString('o') } else { $null })
+    $rec.DesktopIdle = $(if ($r.Time) { $r.Time.ToString('o') } else { $null })
+    # what used the CPU after sign-in
+    $since = $signIn.AddSeconds(-10)
+    $procs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.CreationDate -ge $since -and $_.ExecutablePath })
+    $rec.ProcessesStarted = $procs.Count
+    $rec.TopProcesses = @($procs | Group-Object ExecutablePath | ForEach-Object {
+            $cpu = 0; foreach ($p in $_.Group) { $cpu += ([double]$p.KernelModeTime + [double]$p.UserModeTime) / 1e7 }
+            $first = ($_.Group | Sort-Object CreationDate | Select-Object -First 1).CreationDate
+            [pscustomobject]@{ Name = $_.Group[0].Name; Path = $_.Name; CpuSec = [math]::Round($cpu, 1); Count = $_.Count; StartedAfterSec = [math]::Round(($first - $signIn).TotalSeconds, 1) }
+        } | Sort-Object CpuSec -Descending | Select-Object -First 15)
+}
+$rec.Finished = (Get-Date).ToString('o')
+$rec | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $OutDir "$id-$Phase.json") -Encoding UTF8
+
+if ($Phase -eq 'logon' -and -not $NoDisarm) {
+    foreach ($t in 'Boot test - startup', 'Boot test - sign-in') { Unregister-ScheduledTask -TaskName $t -TaskPath '\PAX Startup Scanner\' -Confirm:$false -ErrorAction SilentlyContinue }
+    try { $svc = New-Object -ComObject Schedule.Service; $svc.Connect(); $svc.GetFolder('\').DeleteFolder('PAX Startup Scanner', 0) } catch {}
+    Remove-Item -LiteralPath (Join-Path $root 'boot-test.json') -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $PSCommandPath -ErrorAction SilentlyContinue
+}
+'@
+
+function Format-PssSec($s) {
+    if ($null -eq $s) { return '-' }
+    if ($s -ge 60) { return ('{0}m {1:N0}s' -f [math]::Floor($s / 60), ($s % 60)) }
+    return ('{0:N1}s' -f $s)
+}
+
+function Get-PssBootTestState {
+    # The armed test (label, when) or $null
+    $f = Join-Path (Get-PssDataPath) 'boot-test.json'
+    if (-not (Test-Path -LiteralPath $f)) { return $null }
+    try { return (Get-Content -LiteralPath $f -Raw | ConvertFrom-Json) } catch { return $null }
+}
+
+function Stop-PssBootTest {
+    foreach ($t in 'Boot test - startup', 'Boot test - sign-in') { Unregister-ScheduledTask -TaskName $t -TaskPath '\PAX Startup Scanner\' -Confirm:$false -ErrorAction SilentlyContinue }
+    try { $svc = New-Object -ComObject Schedule.Service; $svc.Connect(); $svc.GetFolder('\').DeleteFolder('PAX Startup Scanner', 0) } catch {}
+    $root = Get-PssDataPath
+    Remove-Item -LiteralPath (Join-Path $root 'boot-test.json') -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $root 'boot-probe.ps1') -ErrorAction SilentlyContinue
+    return @{ Ok = $true; Message = 'Boot test cancelled. Nothing will run at the next restart.' }
+}
+
+function Start-PssBootTest([string]$Label) {
+    # Arms a one-shot timing of the next restart (needs admin: the tasks run as SYSTEM)
+    if ($script:PssReadOnly) { return @{ Ok = $false; Message = 'Read-only mode: boot tests are off (they need scheduled tasks on this PC).' } }
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) { return @{ Ok = $false; Message = 'Timing a restart needs an elevated PowerShell (Run as Administrator).' } }
+    if (-not $Label) { $Label = 'Boot test {0:yyyy-MM-dd HH:mm}' -f (Get-Date) }
+    try {
+        $root = Get-PssDataPath
+        if (-not (Test-Path -LiteralPath $root)) { New-Item -ItemType Directory -Path $root -Force -ErrorAction Stop | Out-Null }
+        $probe = Join-Path $root 'boot-probe.ps1'
+        Set-Content -LiteralPath $probe -Value $script:PssProbeScript -Encoding UTF8 -ErrorAction Stop
+        [pscustomobject]@{ Label = $Label; ArmedAt = (Get-Date).ToString('o'); ArmedBy = "$env:USERDOMAIN\$env:USERNAME" } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'boot-test.json') -Encoding UTF8 -ErrorAction Stop
+        $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
+        $defs = @(
+            @{ Name = 'Boot test - startup'; Phase = 'startup'; Trigger = (New-ScheduledTaskTrigger -AtStartup) }
+            @{ Name = 'Boot test - sign-in'; Phase = 'logon'; Trigger = (New-ScheduledTaskTrigger -AtLogOn) }
+        )
+        foreach ($d in $defs) {
+            $act = New-ScheduledTaskAction -Execute $ps -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Phase {1}' -f $probe, $d.Phase)
+            Register-ScheduledTask -TaskName $d.Name -TaskPath '\PAX Startup Scanner\' -Action $act -Trigger $d.Trigger -Principal $principal -Settings $settings -Description 'PAX Startup Scanner: times the next restart, then removes itself.' -Force -ErrorAction Stop | Out-Null
+        }
+        return @{ Ok = $true; Message = "Boot test '$Label' is ready. Restart the PC (Restart, not Shut down) and sign in. The result shows up here once the desktop has settled." }
+    } catch {
+        $err = Format-PssError $_
+        $null = Stop-PssBootTest
+        return @{ Ok = $false; Message = $err }
+    }
+}
+
+function Restart-PssNow {
+    # Full restart (a "Shut down" with Fast Startup would skip the startup measurement)
+    if ($script:PssReadOnly) { return @{ Ok = $false; Message = 'Read-only mode: the scanner does not restart the PC.' } }
+    $out = & shutdown.exe /r /t 15 /c "PAX Startup Scanner boot test: restarting in 15 seconds." 2>&1
+    if ($LASTEXITCODE -ne 0) { return @{ Ok = $false; Message = ((($out | Out-String) -replace '\s+', ' ').Trim()) } }
+    return @{ Ok = $true; Message = 'Restarting in 15 seconds. To stop it, run: shutdown /a' }
+}
+
+function Get-PssBootTests {
+    # Joins the start-up and sign-in halves of each timed restart; newest first
+    $dir = Join-Path (Get-PssDataPath) 'BootTests'
+    if (-not (Test-Path -LiteralPath $dir)) { return @() }
+    $out = @()
+    foreach ($g in (Get-ChildItem -LiteralPath $dir -Filter '*.json' -File -ErrorAction SilentlyContinue | Group-Object { $_.BaseName -replace '-(startup|logon)$', '' })) {
+        $st = $null; $lg = $null
+        foreach ($f in $g.Group) {
+            try {
+                $j = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json
+                if ($j.Phase -eq 'startup') { $st = $j } elseif ($j.Phase -eq 'logon') { $lg = $j }
+            } catch {}
+        }
+        $src = if ($lg) { $lg } else { $st }
+        if (-not $src) { continue }
+        $boot = [datetime]::Parse([string]$src.BootTime)
+        $idle = if ($st -and $st.IdleBeforeSignIn) { [datetime]::Parse([string]$st.IdleBeforeSignIn) } else { $null }
+        $signIn = if ($lg -and $lg.SignIn) { [datetime]::Parse([string]$lg.SignIn) } else { $null }
+        $desk = if ($lg -and $lg.DesktopIdle) { [datetime]::Parse([string]$lg.DesktopIdle) } else { $null }
+        $first = [bool]($st -and $st.SignedInFirst)
+        # with a quick sign-in the start-up clock runs to the sign-in instead (no waiting at the sign-in screen to subtract)
+        $bootSec = if ($idle) { [math]::Round(($idle - $boot).TotalSeconds, 1) } elseif ($first -and $signIn) { [math]::Round(($signIn - $boot).TotalSeconds, 1) } else { $null }
+        $signSec = if ($signIn -and $desk) { [math]::Round(($desk - $signIn).TotalSeconds, 1) } else { $null }
+        $total = if ($null -ne $bootSec -and $null -ne $signSec) { [math]::Round($bootSec + $signSec, 1) } else { $null }
+        $label = if ($lg -and $lg.Label) { [string]$lg.Label } elseif ($st -and $st.Label) { [string]$st.Label } else { '' }
+        $notes = @()
+        if (-not $st) { $notes += 'start-up half missing' }
+        if (-not $lg) { $notes += $(if ($st) { 'waiting for sign-in' } else { 'sign-in half missing' }) }
+        if ($first) { $notes += 'signed in before Windows went idle' }
+        if ($lg -and -not $desk) { $notes += "desktop didn't settle within 10 minutes" }
+        if ($st -and -not $idle -and -not $first) { $notes += "Windows didn't settle within 10 minutes" }
+        $out += [pscustomobject]@{
+            Id = $g.Name; Boot = $boot; When = $boot.ToString('yyyy-MM-dd HH:mm'); Label = $label
+            BootToIdleSec = $bootSec; SignInToIdleSec = $signSec; TotalSec = $total
+            BootText = (Format-PssSec $bootSec); SignInText = (Format-PssSec $signSec); TotalText = (Format-PssSec $total)
+            SignedInFirst = $first; SignIn = $signIn
+            ProcessesStarted = $(if ($lg) { $lg.ProcessesStarted } else { $null })
+            TopProcesses = $(if ($lg) { @($lg.TopProcesses) } else { @() })
+            Notes = ($notes -join '; ')
+        }
+    }
+    return @($out | Sort-Object Boot -Descending)
+}
+
+function Get-PssChangeHistory {
+    # Every change saved by the scanner (still undoable or already undone), oldest first
+    $out = @()
+    $base = Get-PssBackupPath
+    foreach ($d in @($base, (Join-Path $base 'Restored'))) {
+        if (-not (Test-Path -LiteralPath $d)) { continue }
+        foreach ($f in (Get-ChildItem -LiteralPath $d -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+            try {
+                $r = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json
+                $out += [pscustomobject]@{ Time = [datetime]::Parse([string]$r.Time); Action = [string]$r.Action; Category = [string]$r.Category; Name = [string]$r.Name; Undone = ($d -ne $base) }
+            } catch {}
+        }
+    }
+    return @($out | Sort-Object Time)
+}
+
+function Compare-PssBootTests($Old, $New) {
+    # Before/after comparison as display lines: @{ Text; Color }
+    $lines = New-Object System.Collections.Generic.List[object]
+    $add = { param([string]$t, [string]$c = 'Gray') $lines.Add([pscustomobject]@{ Text = $t; Color = $c }) }
+    $on = if ($Old.Label) { $Old.Label } else { 'Earlier test' }
+    $nn = if ($New.Label) { $New.Label } else { 'Later test' }
+    & $add ('{0} ({1})  ->  {2} ({3})' -f $on, $Old.When, $nn, $New.When) 'White'
+    & $add ''
+    $rows = @(
+        @('Windows start-up (power-on to idle sign-in screen)', 'BootToIdleSec'),
+        @('Sign-in to desktop ready', 'SignInToIdleSec'),
+        @('Total start-up time (not counting time at the sign-in screen)', 'TotalSec')
+    )
+    foreach ($m in $rows) {
+        $a = $Old.($m[1]); $b = $New.($m[1])
+        if ($null -eq $a -or $null -eq $b) { & $add ('  {0,-64}{1,9} ->{2,9}' -f $m[0], (Format-PssSec $a), (Format-PssSec $b)) 'DarkGray'; continue }
+        $d = [math]::Round($b - $a, 1)
+        $pct = if ($a -gt 0) { [math]::Round(100 * [math]::Abs($d) / $a) } else { 0 }
+        $verdict = if ([math]::Abs($d) -lt 2) { 'about the same' } elseif ($d -lt 0) { '{0:N1}s faster (-{1}%)' -f (-$d), $pct } else { '{0:N1}s slower (+{1}%)' -f $d, $pct }
+        $color = if ([math]::Abs($d) -lt 2) { 'Gray' } elseif ($d -lt 0) { 'Green' } else { 'Red' }
+        & $add ('  {0,-64}{1,9} ->{2,9}   {3}' -f $m[0], (Format-PssSec $a), (Format-PssSec $b), $verdict) $color
+    }
+    if ($null -ne $Old.ProcessesStarted -and $null -ne $New.ProcessesStarted) {
+        & $add ('  {0,-64}{1,9} ->{2,9}' -f 'Programs started after sign-in', $Old.ProcessesStarted, $New.ProcessesStarted) 'Gray'
+    }
+    & $add ''
+    & $add 'Changes made with PAX Startup Scanner between the two tests:' 'White'
+    $changes = @(Get-PssChangeHistory | Where-Object { $_.Time -gt $Old.Boot -and $_.Time -lt $New.Boot })
+    if (-not $changes) { & $add '  None recorded. Windows updates, new software and other changes also affect start-up time.' 'DarkGray' }
+    foreach ($c in $changes) { & $add ('  {0,-8} {1,-15} {2}{3}' -f $c.Action, $c.Category, $c.Name, $(if ($c.Undone) { '   (undone later)' } else { '' })) $(if ($c.Action -eq 'Delete') { 'Red' } else { 'Yellow' }) }
+    & $add ''
+    & $add 'Busiest programs after sign-in (CPU seconds used until the desktop was ready):' 'White'
+    $fmt = { param($t) if ($t.TopProcesses) { (@($t.TopProcesses | Select-Object -First 6 | ForEach-Object { '{0} {1:N1}s' -f $_.Name, $_.CpuSec }) -join ', ') } else { '-' } }
+    & $add ('  Before: ' + (& $fmt $Old)) 'Gray'
+    & $add ('  After:  ' + (& $fmt $New)) 'Gray'
+    & $add ''
+    & $add 'Start-up times vary by a few seconds between restarts. For a fair comparison, time two or three restarts each way.' 'DarkGray'
+    return $lines
 }
 
 # ======================================================================================
@@ -1565,7 +1877,7 @@ function Write-PssHeader($Scan) {
     Write-Host ''
     Write-Host ('  ' + [char]0x2554 + ($h * $inner) + [char]0x2557) -ForegroundColor DarkCyan
     $t1 = "  PAX STARTUP SCANNER  v$($script:PssVersion)"
-    $t2 = 'IT diagnostics  '
+    $t2 = if ($script:PssReadOnly) { 'READ-ONLY  -  IT diagnostics  ' } else { 'IT diagnostics  ' }
     Write-Host ('  ' + [char]0x2551) -NoNewline -ForegroundColor DarkCyan
     Write-Host $t1 -NoNewline -ForegroundColor White
     Write-Host ($t2.PadLeft($inner - $t1.Length)) -NoNewline -ForegroundColor DarkGray
@@ -1615,11 +1927,13 @@ function Write-PssDashboard($Scan) {
 
     Write-PssRule 'Where things start from'
     $groups = $items | Group-Object Category | Sort-Object Count -Descending
-    Write-Host ('   {0,-18}{1,7}{2,13}{3,10}' -f 'Category', 'Total', 'Third-party', 'Flagged') -ForegroundColor DarkGray
+    Write-Host ('   {0,-18}{1,7}{2,6}{3,6}{4,13}{5,10}' -f 'Category', 'Total', 'On', 'Off', 'Third-party', 'Flagged') -ForegroundColor DarkGray
     foreach ($g in $groups) {
+        $on = @($g.Group | Where-Object { $_.Enabled -and $_.State -ne 'Removed' }).Count
         $tp = @($g.Group | Where-Object { -not $_.IsMicrosoft }).Count
         $fl = @($g.Group | Where-Object { $_.Risk -in 'High', 'Medium' }).Count
-        Write-Host ('   {0,-18}{1,7}' -f $g.Name, $g.Count) -NoNewline -ForegroundColor Gray
+        Write-Host ('   {0,-18}{1,7}{2,6}' -f $g.Name, $g.Count, $on) -NoNewline -ForegroundColor Gray
+        Write-Host ('{0,6}' -f ($g.Count - $on)) -NoNewline -ForegroundColor $(if ($g.Count - $on) { 'DarkYellow' } else { 'DarkGray' })
         Write-Host ('{0,13}' -f $tp) -NoNewline -ForegroundColor $(if ($tp) { 'White' } else { 'DarkGray' })
         Write-Host ('{0,10}' -f $fl) -ForegroundColor $(if ($fl) { 'Yellow' } else { 'DarkGray' })
     }
@@ -1739,16 +2053,21 @@ function Show-PssDetails($Scan, [int]$Id) {
                     $why = if ($it.ActionNote) { $it.ActionNote } elseif ($action -eq 'Delete') { "This entry can't be deleted here." } else { "This entry can't be disabled, only deleted." }
                     Write-Host "   $why" -ForegroundColor Yellow; Start-Sleep 2; break
                 }
-                Write-Host ''
-                $lines = (Get-PssConfirmText $it $action) -split "`n"
-                Write-Host "   $($lines[0])" -ForegroundColor $(if ($action -eq 'Delete') { 'Red' } else { 'Yellow' })
-                foreach ($l in ($lines | Select-Object -Skip 1)) { Write-Host "   $l" -ForegroundColor Gray }
-                Write-Host ''
-                Write-Host '   Type Y to confirm > ' -NoNewline -ForegroundColor Cyan
-                if ((Read-PssKey) -match '^(?i)y(es)?$') {
+                # Disable/Enable are reversible and happen straight away; only Delete asks first
+                $go = $true
+                if ($action -eq 'Delete') {
+                    Write-Host ''
+                    $lines = (Get-PssConfirmText $it $action) -split "`n"
+                    Write-Host "   $($lines[0])" -ForegroundColor Red
+                    foreach ($l in ($lines | Select-Object -Skip 1)) { Write-Host "   $l" -ForegroundColor Gray }
+                    Write-Host ''
+                    Write-Host '   Type Y to confirm > ' -NoNewline -ForegroundColor Cyan
+                    $go = (Read-PssKey) -match '^(?i)y(es)?$'
+                }
+                if ($go) {
                     $res = Invoke-PssChange $it $action
                     Write-Host "   $($res.Message)" -ForegroundColor $(if ($res.Ok) { 'Green' } else { 'Red' })
-                    if ($res.Ok) { Start-Sleep -Milliseconds 1500 } else { Write-Host '   Press Enter to continue > ' -NoNewline -ForegroundColor Cyan; $null = Read-PssKey }
+                    if ($res.Ok) { Start-Sleep -Milliseconds 1200 } else { Write-Host '   Press Enter to continue > ' -NoNewline -ForegroundColor Cyan; $null = Read-PssKey }
                 }
             }
             '^(?i)o$' { Open-PssLocation $it }
@@ -1779,17 +2098,130 @@ function Read-PssPick($Scan, $Result) {
     if ($k -match '^\d+$') { Show-PssDetails $Scan ([int]$k) }
 }
 
-function Get-PssVisible($Scan) {
-    if ($script:PssShowMicrosoft) { return $Scan.Items }
-    return @($Scan.Items | Where-Object { -not $_.IsMicrosoft -or $_.Risk -ne 'OK' })
+function Select-PssView($Items, [switch]$Browse) {
+    # Console view filters: [A] only items that are on (every list), [M] clean Microsoft items (browse/search lists)
+    $out = @($Items | Where-Object { $_ })
+    if ($Browse -and -not $script:PssShowMicrosoft) { $out = @($out | Where-Object { -not $_.IsMicrosoft -or $_.Risk -ne 'OK' }) }
+    if ($script:PssOnlyEnabled) { $out = @($out | Where-Object { $_.Enabled -and $_.State -ne 'Removed' }) }
+    return , $out
+}
+
+function Write-PssViewNote {
+    $bits = @()
+    if ($script:PssOnlyEnabled) { $bits += 'only items that are on' }
+    if (-not $script:PssShowMicrosoft) { $bits += 'clean Microsoft items hidden in browse/search' }
+    if ($bits) { Write-Host ('   View: ' + ($bits -join ', ') + '   ([A] / [M] in the main menu)') -ForegroundColor DarkGray }
+}
+
+function Show-PssGroups($Scan, [string]$Property, [string]$Title, [string]$Label) {
+    # Category / publisher lists with counts; pick one to list its items
+    Write-PssHeader $Scan
+    $items = Select-PssView $Scan.Items -Browse
+    $groups = @($items | Group-Object -Property $Property | Sort-Object @{ E = { $_.Count }; Descending = $true }, Name)
+    Write-PssRule "$Title ($($groups.Count))"
+    $nameW = [Math]::Max(24, [Math]::Min(52, (Get-PssWidth) - 46))
+    Write-Host ('   {0,-5}{1}{2,7}{3,6}{4,6}{5,9}' -f '#', (Format-PssCell $Label $nameW), 'Items', 'On', 'Off', 'Flagged') -ForegroundColor DarkGray
+    for ($i = 0; $i -lt $groups.Count; $i++) {
+        $g = $groups[$i]
+        $on = @($g.Group | Where-Object { $_.Enabled -and $_.State -ne 'Removed' }).Count
+        $fl = @($g.Group | Where-Object { $_.Risk -in 'High', 'Medium' }).Count
+        Write-Host ('   [{0,2}] ' -f ($i + 1)) -NoNewline -ForegroundColor Cyan
+        Write-Host (Format-PssCell ([string]$g.Name) $nameW) -NoNewline -ForegroundColor White
+        Write-Host ('{0,7}{1,6}' -f $g.Count, $on) -NoNewline -ForegroundColor Gray
+        Write-Host ('{0,6}' -f ($g.Count - $on)) -NoNewline -ForegroundColor $(if ($g.Count - $on) { 'DarkYellow' } else { 'DarkGray' })
+        Write-Host ('{0,9}' -f $fl) -ForegroundColor $(if ($fl) { 'Yellow' } else { 'DarkGray' })
+    }
+    Write-Host ''
+    Write-PssViewNote
+    Write-Host "   Number to list those items, or Enter to go back > " -NoNewline -ForegroundColor Cyan
+    $k = Read-PssKey
+    if ($k -match '^\d+$' -and [int]$k -ge 1 -and [int]$k -le $groups.Count) {
+        $g = $groups[[int]$k - 1]
+        Write-PssHeader $Scan
+        $r = Write-PssTable $g.Group "$($Label): $($g.Name)"
+        Read-PssPick $Scan $r
+    }
+}
+
+function Write-PssBootTests {
+    # The timed restarts table; returns the tests (newest first)
+    Write-PssRule 'Boot tests (restarts timed by PAX Startup Scanner)'
+    $state = Get-PssBootTestState
+    if ($state) { Write-Host ("   Ready: '{0}'. Restart the PC and sign in to run it ([C] cancels it)." -f $state.Label) -ForegroundColor Yellow }
+    $tests = @(Get-PssBootTests)
+    if (-not $tests) {
+        Write-Host '   No timed restarts yet. Press T to time the next restart, make your changes, then time another restart and compare.' -ForegroundColor DarkGray
+        return , $tests
+    }
+    Write-Host ('   {0,-5}{1,-18}{2}{3,11}{4,12}{5,10}  {6}' -f '#', 'Restarted', (Format-PssCell 'Name' 22), 'Start-up', 'Sign-in', 'Total', 'Notes') -ForegroundColor DarkGray
+    for ($i = 0; $i -lt [Math]::Min($tests.Count, 8); $i++) {
+        $t = $tests[$i]
+        Write-Host ('   [{0}] ' -f ($i + 1)) -NoNewline -ForegroundColor Cyan
+        Write-Host ('{0,-18}' -f $t.When) -NoNewline -ForegroundColor Gray
+        Write-Host (Format-PssCell $t.Label 22) -NoNewline -ForegroundColor White
+        Write-Host ('{0,11}{1,12}' -f $t.BootText, $t.SignInText) -NoNewline -ForegroundColor Gray
+        Write-Host ('{0,10}' -f $t.TotalText) -NoNewline -ForegroundColor White
+        Write-Host ('  ' + $t.Notes) -ForegroundColor DarkYellow
+    }
+    Write-Host '   Start-up = power-on until Windows is idle at the sign-in screen. Sign-in = sign-in until the desktop is idle.' -ForegroundColor DarkGray
+    return , $tests
 }
 
 function Show-PssBoot($Scan) {
-    Write-PssHeader $Scan
+    while ($true) {
+        Write-PssHeader $Scan
+        $tests = Write-PssBootTests
+        Write-PssBootLog $Scan
+        Write-Host ''
+        Write-Host '   [T] Time the next restart   [V] Compare two tests   [C] Cancel a ready test   [S] Restart now   [Enter] Back' -ForegroundColor Cyan
+        Write-Host '   > ' -NoNewline -ForegroundColor Cyan
+        $k = Read-PssKey
+        switch -Regex ($k) {
+            '^(?i)t$' {
+                $def = if ($tests) { 'After changes' } else { 'Before changes' }
+                Write-Host "   Name for this test [$def] > " -NoNewline -ForegroundColor Cyan
+                $lbl = Read-PssKey; if (-not $lbl) { $lbl = $def }
+                $r = Start-PssBootTest $lbl
+                Write-Host "   $($r.Message)" -ForegroundColor $(if ($r.Ok) { 'Green' } else { 'Red' })
+                if ($r.Ok) {
+                    Write-Host '   Restart now? Save your work first. Type Y to restart in 15 seconds, or Enter to restart later > ' -NoNewline -ForegroundColor Yellow
+                    if ((Read-PssKey) -match '^(?i)y(es)?$') { $rr = Restart-PssNow; Write-Host "   $($rr.Message)" -ForegroundColor $(if ($rr.Ok) { 'Yellow' } else { 'Red' }); Start-Sleep 2 }
+                } else { Write-Host '   Press Enter to continue > ' -NoNewline -ForegroundColor Cyan; $null = Read-PssKey }
+                break
+            }
+            '^(?i)c$' { $r = Stop-PssBootTest; Write-Host "   $($r.Message)" -ForegroundColor Green; Start-Sleep -Milliseconds 1200; break }
+            '^(?i)v$' {
+                if ($tests.Count -lt 2) { Write-Host '   Two timed restarts are needed for a comparison.' -ForegroundColor Yellow; Start-Sleep 2; break }
+                Write-Host '   Compare which two tests? e.g. "2 1". Enter compares the latest two > ' -NoNewline -ForegroundColor Cyan
+                $nums = @([regex]::Matches((Read-PssKey), '\d+') | ForEach-Object { [int]$_.Value })
+                if ($nums.Count -ge 2 -and $nums[0] -ge 1 -and $nums[1] -ge 1 -and $nums[0] -le $tests.Count -and $nums[1] -le $tests.Count -and $nums[0] -ne $nums[1]) {
+                    $a = $tests[$nums[0] - 1]; $b = $tests[$nums[1] - 1]
+                } else { $a = $tests[1]; $b = $tests[0] }
+                if ($a.Boot -gt $b.Boot) { $tmp = $a; $a = $b; $b = $tmp }
+                Write-PssHeader $Scan
+                Write-PssRule 'Boot test comparison'
+                foreach ($l in (Compare-PssBootTests $a $b)) { Write-Host ('   ' + $l.Text) -ForegroundColor $l.Color }
+                Write-Host ''
+                Write-Host '   Press Enter to go back > ' -NoNewline -ForegroundColor Cyan; $null = Read-PssKey
+                break
+            }
+            '^(?i)s$' {
+                Write-Host '   Restart the PC in 15 seconds? Save your work first. Type Y to confirm > ' -NoNewline -ForegroundColor Yellow
+                if ((Read-PssKey) -match '^(?i)y(es)?$') { $rr = Restart-PssNow; Write-Host "   $($rr.Message)" -ForegroundColor $(if ($rr.Ok) { 'Yellow' } else { 'Red' }); Start-Sleep 2 }
+                break
+            }
+            '^\d+$' { Show-PssDetails $Scan ([int]$k); break }
+            default { return }
+        }
+    }
+}
+
+function Write-PssBootLog($Scan) {
+    # What Windows' own Diagnostics-Performance log recorded, plus the heaviest running startup items
     $b = $Scan.Boot
-    if (-not $b.Available) { Write-Host ''; Write-Host "   $($b.Error)" -ForegroundColor Yellow }
+    if (-not $b.Available) { Write-Host ''; Write-Host "   Windows' boot log: $($b.Error)" -ForegroundColor DarkYellow }
     else {
-        Write-PssRule 'Recent boots'
+        Write-PssRule "Recent boots (Windows' own log)"
         Write-Host ('   {0,-18}{1,10}{2,12}{3,12}' -f 'When', 'Total', 'To desktop', 'Settling') -ForegroundColor DarkGray
         foreach ($x in @($b.Boots | Select-Object -First 10)) {
             $c = if ($x.BootSec -gt 90) { 'Red' } elseif ($x.BootSec -gt 45) { 'Yellow' } else { 'Green' }
@@ -1823,7 +2255,7 @@ function Show-PssBoot($Scan) {
             }
         }
     }
-    $heavy = @($Scan.Items | Where-Object { $_.Running -and $_.ProcCount } | Sort-Object MemoryMB -Descending | Select-Object -First 12)
+    $heavy = @($Scan.Items | Where-Object { $_.Running -and $_.ProcCount } | Sort-Object MemoryMB -Descending | Select-Object -First 10)
     Write-PssRule 'Startup items using the most memory right now'
     foreach ($it in $heavy) {
         $c = if ($it.MemoryMB -ge 400) { 'Red' } elseif ($it.MemoryMB -ge 150) { 'Yellow' } else { 'Gray' }
@@ -1832,29 +2264,10 @@ function Show-PssBoot($Scan) {
         Write-Host ('{0,8} MB' -f $it.MemoryMB) -NoNewline -ForegroundColor $c
         Write-Host ('{0,9}s CPU  {1} proc' -f $it.CpuSec, $it.ProcCount) -ForegroundColor DarkGray
     }
-    Read-PssPick $Scan $null
-}
-
-function Show-PssCategories($Scan) {
-    Write-PssHeader $Scan
-    $groups = @((Get-PssVisible $Scan) | Group-Object Category | Sort-Object Name)
-    Write-PssRule 'Categories'
-    for ($i = 0; $i -lt $groups.Count; $i++) {
-        Write-Host ('   [{0,2}] ' -f ($i + 1)) -NoNewline -ForegroundColor Cyan
-        Write-Host ('{0,-18}{1,5} items' -f $groups[$i].Name, $groups[$i].Count) -ForegroundColor Gray
-    }
-    Write-Host ''
-    Write-Host '   Category number > ' -NoNewline -ForegroundColor Cyan
-    $k = Read-PssKey
-    if ($k -match '^\d+$' -and [int]$k -ge 1 -and [int]$k -le $groups.Count) {
-        $g = $groups[[int]$k - 1]
-        Write-PssHeader $Scan
-        $r = Write-PssTable $g.Group $g.Name
-        Read-PssPick $Scan $r
-    }
 }
 
 function Invoke-PssExportPrompt($Scan) {
+    if ($script:PssReadOnly) { Write-Host '   Read-only mode: reports are not saved. Run without -ReadOnly to export.' -ForegroundColor Yellow; Start-Sleep 2; return }
     $desk = [Environment]::GetFolderPath('Desktop')
     $def = Join-Path $desk ('PAX-Startup-{0}-{1:yyyyMMdd-HHmm}.html' -f $Scan.Computer, $Scan.ScannedAt)
     Write-Host ''
@@ -1923,14 +2336,19 @@ function Start-PssConsole($Scan) {
     while ($true) {
         Write-PssHeader $Scan
         Write-PssDashboard $Scan
-        $fl = @($Scan.Items | Where-Object { $_.Risk -in 'High', 'Medium' }).Count
-        $tp = @($Scan.Items | Where-Object { -not $_.IsMicrosoft }).Count
+        $flagged = Select-PssView ($Scan.Items | Where-Object { $_.Risk -in 'High', 'Medium' })
+        $third = Select-PssView ($Scan.Items | Where-Object { -not $_.IsMicrosoft })
+        $all = Select-PssView $Scan.Items
+        $browse = Select-PssView $Scan.Items -Browse
+        $nCat = @($browse | Group-Object Category).Count; $nPub = @($browse | Group-Object Vendor).Count
+        $tests = @(Get-PssBootTests).Count
         Write-PssRule 'Menu'
         $menu = @(
-            @('1', "Review flagged items ($fl)"), @('5', 'Search'),
-            @('2', "Third-party startup items ($tp)"), @('6', 'Boot performance / slowdowns'),
-            @('3', 'Browse by category'), @('E', 'Export report (HTML/CSV/JSON)'),
-            @('4', "All items incl. Microsoft ($($Scan.Items.Count))"), @('G', 'Open GUI view'),
+            @('1', "Review flagged items ($($flagged.Count))"), @('5', "Browse by publisher ($nPub)"),
+            @('2', "Third-party startup items ($($third.Count))"), @('6', 'Search'),
+            @('3', "All items incl. Microsoft ($($all.Count))"), @('7', "Boot times and boot tests ($tests)"),
+            @('4', "Browse by category ($nCat)"), @('E', 'Export report (HTML/CSV/JSON)'),
+            @('A', $(if ($script:PssOnlyEnabled) { 'Show items that are on AND off' } else { 'Show only items that are on' })), @('G', 'Open GUI view'),
             @('M', $(if ($script:PssShowMicrosoft) { 'Browse/search: hide Microsoft' } else { 'Browse/search: show Microsoft' })), @('R', 'Rescan'),
             @('U', "Undo a change ($(@(Get-PssUndoRecords).Count) saved)"), @('Q', 'Quit')
         )
@@ -1942,25 +2360,29 @@ function Start-PssConsole($Scan) {
             }
             Write-Host ''
         }
+        Write-PssViewNote
         Write-Host '   Type an item number at any prompt to see its details, then D to disable or X to delete it' -ForegroundColor DarkGray
         Write-Host ''
         Write-Host '   > ' -NoNewline -ForegroundColor Cyan
         $k = Read-PssKey
         if ($script:PssEof) { Write-Host ''; return }
+        $on = if ($script:PssOnlyEnabled) { ' - only items that are on' } else { '' }
         switch -Regex ($k) {
-            '^1$' { Write-PssHeader $Scan; $r = Write-PssTable ($Scan.Items | Where-Object { $_.Risk -in 'High', 'Medium' }) 'Flagged items (high and medium risk)'; Read-PssPick $Scan $r ; break }
-            '^2$' { Write-PssHeader $Scan; $r = Write-PssTable ($Scan.Items | Where-Object { -not $_.IsMicrosoft }) 'Third-party startup items'; Read-PssPick $Scan $r ; break }
-            '^3$' { Show-PssCategories $Scan ; break }
-            '^4$' { Write-PssHeader $Scan; $r = Write-PssTable $Scan.Items 'All startup items'; Read-PssPick $Scan $r ; break }
-            '^5$' {
+            '^1$' { Write-PssHeader $Scan; $r = Write-PssTable $flagged "Flagged items (high and medium risk)$on"; Read-PssPick $Scan $r ; break }
+            '^2$' { Write-PssHeader $Scan; $r = Write-PssTable $third "Third-party startup items$on"; Read-PssPick $Scan $r ; break }
+            '^3$' { Write-PssHeader $Scan; $r = Write-PssTable $all "All startup items$on"; Read-PssPick $Scan $r ; break }
+            '^4$' { Show-PssGroups $Scan 'Category' 'Startup items by category' 'Category' ; break }
+            '^5$' { Show-PssGroups $Scan 'Vendor' 'Startup items by publisher' 'Publisher' ; break }
+            '^6$' {
                 Write-Host '   Search name, file, publisher or command > ' -NoNewline -ForegroundColor Cyan
                 $q = Read-PssKey
                 if ($q) {
-                    $hits = @((Get-PssVisible $Scan) | Where-Object { "$($_.Name) $($_.ImagePath) $($_.Publisher) $($_.Command) $($_.Location) $($_.Description)" -like "*$q*" })
-                    Write-PssHeader $Scan; $r = Write-PssTable $hits "Search: $q"; Read-PssPick $Scan $r
+                    $hits = Select-PssView ($Scan.Items | Where-Object { "$($_.Name) $($_.ImagePath) $($_.Publisher) $($_.Command) $($_.Location) $($_.Description)" -like "*$q*" }) -Browse
+                    Write-PssHeader $Scan; $r = Write-PssTable $hits "Search: $q$on"; Read-PssPick $Scan $r
                 }
             ; break }
-            '^6$' { Show-PssBoot $Scan ; break }
+            '^7$' { Show-PssBoot $Scan ; break }
+            '^(?i)a$' { $script:PssOnlyEnabled = -not $script:PssOnlyEnabled ; break }
             '^(?i)e$' { Invoke-PssExportPrompt $Scan ; break }
             '^(?i)g$' { $Scan = Show-PssGui $Scan ; break }
             '^(?i)m$' { $script:PssShowMicrosoft = -not $script:PssShowMicrosoft ; break }
@@ -2008,6 +2430,29 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
       <Setter Property="Background" Value="#3A1D22"/><Setter Property="BorderBrush" Value="#7A2E38"/><Setter Property="Foreground" Value="#FFC9CE"/>
     </Style>
     <Style TargetType="CheckBox"><Setter Property="Foreground" Value="#C9CEDA"/><Setter Property="VerticalAlignment" Value="Center"/><Setter Property="Margin" Value="0,0,14,0"/></Style>
+    <Style TargetType="ListBox">
+      <Setter Property="Background" Value="Transparent"/><Setter Property="BorderThickness" Value="0"/><Setter Property="Foreground" Value="#C9CEDA"/>
+      <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Disabled"/>
+    </Style>
+    <Style TargetType="ListBoxItem">
+      <Setter Property="Padding" Value="7,2"/><Setter Property="Cursor" Value="Hand"/><Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ListBoxItem">
+        <Border x:Name="b" Background="Transparent" CornerRadius="4" Padding="{TemplateBinding Padding}"><ContentPresenter/></Border>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="Background" Value="#20252F"/></Trigger>
+          <Trigger Property="IsSelected" Value="True"><Setter TargetName="b" Property="Background" Value="#1E3A5F"/><Setter Property="Foreground" Value="#FFFFFF"/></Trigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate></Setter.Value></Setter>
+    </Style>
+    <DataTemplate x:Key="FacetItem">
+      <Grid>
+        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+        <TextBlock Text="{Binding Label}" TextTrimming="CharacterEllipsis" ToolTip="{Binding Label}"/>
+        <TextBlock Grid.Column="1" Text="{Binding Count}" Foreground="#8B93A5" Margin="8,0,0,0"/>
+      </Grid>
+    </DataTemplate>
+    <Style TargetType="ContextMenu"><Setter Property="Background" Value="#1B1F27"/><Setter Property="Foreground" Value="#E6E8EE"/><Setter Property="BorderBrush" Value="#30364A"/></Style>
+    <Style TargetType="MenuItem"><Setter Property="Foreground" Value="#E6E8EE"/><Setter Property="Padding" Value="6,4"/></Style>
     <Style TargetType="TextBox"><Setter Property="Background" Value="#171A21"/><Setter Property="Foreground" Value="#E6E8EE"/><Setter Property="BorderBrush" Value="#30364A"/><Setter Property="CaretBrush" Value="#E6E8EE"/><Setter Property="Padding" Value="6,4"/></Style>
     <Style TargetType="DataGridColumnHeader">
       <Setter Property="Background" Value="#171A21"/><Setter Property="Foreground" Value="#8B93A5"/><Setter Property="Padding" Value="8,6"/>
@@ -2085,9 +2530,8 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
         <TextBox x:Name="Search" ToolTip="Filter by name, file, publisher, command"/>
         <TextBlock x:Name="SearchHint" Text="Search name, file, publisher, command..." Foreground="#6B7385" Margin="9,0,0,0" VerticalAlignment="Center" IsHitTestVisible="False"/>
       </Grid>
-      <ComboBox x:Name="Cat" Width="160" DockPanel.Dock="Left" Margin="0,0,14,0"/>
       <CheckBox x:Name="HideMs" IsChecked="True" DockPanel.Dock="Left">Hide clean Microsoft items</CheckBox>
-      <CheckBox x:Name="FlagOnly" DockPanel.Dock="Left">Flagged only</CheckBox>
+      <Button x:Name="BtnClear" DockPanel.Dock="Left" ToolTip="Show everything again (keeps the Microsoft switch)">Clear filters</Button>
       <Button x:Name="BtnExport" DockPanel.Dock="Right" Margin="0">Export report</Button>
       <Button x:Name="BtnRescan" DockPanel.Dock="Right">Rescan</Button>
     </DockPanel>
@@ -2095,17 +2539,24 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
     <TabControl x:Name="Tabs" Grid.Row="3" Background="Transparent" BorderThickness="0" Padding="0">
       <TabItem Header="Startup items">
         <Grid>
+        <Grid.ColumnDefinitions><ColumnDefinition Width="232"/><ColumnDefinition Width="10"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+        <Border Grid.Column="0" Background="{StaticResource Card}" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="6">
+          <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="6,2,6,8">
+            <StackPanel x:Name="Facets"/>
+          </ScrollViewer>
+        </Border>
+        <Grid Grid.Column="2">
           <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="5"/><RowDefinition Height="230"/></Grid.RowDefinitions>
           <DataGrid x:Name="Grid">
             <DataGrid.Columns>
               <DataGridTextColumn Header="#" Binding="{Binding Id}" Width="44"/>
               <DataGridTextColumn Header="Risk" Binding="{Binding Risk}" Width="64" SortMemberPath="RiskScore"/>
-              <DataGridTextColumn Header="Category" Binding="{Binding Category}" Width="110"/>
-              <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="230"/>
-              <DataGridTextColumn Header="On" Binding="{Binding EnabledText}" Width="42"/>
-              <DataGridTextColumn Header="Publisher" Binding="{Binding Publisher}" Width="170"/>
+              <DataGridTextColumn Header="Category" Binding="{Binding Category}" Width="105"/>
+              <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="210"/>
+              <DataGridTextColumn Header="On" Binding="{Binding EnabledText}" Width="56"/>
+              <DataGridTextColumn Header="Publisher" Binding="{Binding Publisher}" Width="150"/>
               <DataGridTextColumn Header="Signed" Binding="{Binding SignText}" Width="74"/>
-              <DataGridTextColumn Header="File" Binding="{Binding ImagePath}" Width="*" MinWidth="260"/>
+              <DataGridTextColumn Header="File" Binding="{Binding ImagePath}" Width="*" MinWidth="200"/>
               <DataGridTextColumn Header="Boot delay" Binding="{Binding BootDelayText}" Width="76" SortMemberPath="BootDelayMs"/>
               <DataGridTextColumn Header="Memory" Binding="{Binding RunText}" Width="70" SortMemberPath="MemoryMB"/>
             </DataGrid.Columns>
@@ -2125,6 +2576,39 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
               </DockPanel>
               <TextBox x:Name="Detail" IsReadOnly="True" BorderThickness="0" Background="Transparent" FontFamily="Consolas" FontSize="12" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/>
             </DockPanel>
+          </Border>
+        </Grid>
+        </Grid>
+      </TabItem>
+      <TabItem x:Name="BootTestTab" Header="Boot tests">
+        <Grid Margin="0,8,0,0">
+          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="190"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+          <TextBlock Grid.Row="0" TextWrapping="Wrap" Foreground="{StaticResource Mut}" Margin="2,0,0,10" Text="Time a restart before you change anything, make your changes, then time another restart and compare. Start-up is power-on until Windows is idle at the sign-in screen; Sign-in is sign-in until the desktop is idle (time spent typing your password is not counted). Each test runs once and removes itself."/>
+          <DockPanel Grid.Row="1" LastChildFill="False" Margin="0,0,0,8">
+            <TextBlock DockPanel.Dock="Left" Text="Test name" VerticalAlignment="Center" Margin="2,0,8,0" Foreground="{StaticResource Mut}"/>
+            <TextBox x:Name="BtLabel" DockPanel.Dock="Left" Width="190" Margin="0,0,8,0"/>
+            <Button x:Name="BtnBtArm" DockPanel.Dock="Left">Time the next restart</Button>
+            <Button x:Name="BtnBtCancel" DockPanel.Dock="Left">Cancel test</Button>
+            <Button x:Name="BtnBtRestart" DockPanel.Dock="Left">Restart now</Button>
+            <TextBlock x:Name="BtState" DockPanel.Dock="Left" VerticalAlignment="Center" Margin="6,0,0,0" Foreground="#FBBF24"/>
+            <Button x:Name="BtnBtRefresh" DockPanel.Dock="Right" Margin="0">Refresh</Button>
+          </DockPanel>
+          <DataGrid x:Name="BtGrid" Grid.Row="2" SelectionMode="Extended">
+            <DataGrid.Columns>
+              <DataGridTextColumn Header="Restarted" Binding="{Binding When}" Width="130"/>
+              <DataGridTextColumn Header="Name" Binding="{Binding Label}" Width="*" MinWidth="200"/>
+              <DataGridTextColumn Header="Start-up" Binding="{Binding BootText}" Width="90" SortMemberPath="BootToIdleSec"/>
+              <DataGridTextColumn Header="Sign-in" Binding="{Binding SignInText}" Width="90" SortMemberPath="SignInToIdleSec"/>
+              <DataGridTextColumn Header="Total" Binding="{Binding TotalText}" Width="90" SortMemberPath="TotalSec"/>
+              <DataGridTextColumn Header="Notes" Binding="{Binding Notes}" Width="300"/>
+            </DataGrid.Columns>
+          </DataGrid>
+          <DockPanel Grid.Row="3" Margin="0,8,0,8" LastChildFill="False">
+            <Button x:Name="BtnBtCompare" DockPanel.Dock="Left">Compare</Button>
+            <TextBlock DockPanel.Dock="Left" VerticalAlignment="Center" Foreground="{StaticResource Mut}" Text="Select two tests (Ctrl+click) to compare them, or one to compare it with the test before it."/>
+          </DockPanel>
+          <Border Grid.Row="4" Background="{StaticResource Card}" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="6" Padding="10">
+            <TextBox x:Name="BtCompare" IsReadOnly="True" BorderThickness="0" Background="Transparent" FontFamily="Consolas" FontSize="12" TextWrapping="NoWrap" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"/>
           </Border>
         </Grid>
       </TabItem>
@@ -2179,7 +2663,7 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
 '@
     $win = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
     $ui = @{}
-    foreach ($n in 'SubTitle', 'Tiles', 'Search', 'SearchHint', 'Cat', 'HideMs', 'FlagOnly', 'BtnExport', 'BtnRescan', 'Banner', 'Grid', 'Detail', 'BtnLoc', 'BtnFile', 'BtnVt', 'BtnWeb', 'BtnCopy', 'BtnToggle', 'BtnDelete', 'BootGrid', 'DelayGrid', 'Tabs', 'UndoTab', 'UndoNote', 'UndoGrid', 'BtnUndoSel', 'BtnUndoFolder', 'BtnUndoRefresh', 'Status') { $ui[$n] = $win.FindName($n) }
+    foreach ($n in 'SubTitle', 'Tiles', 'Search', 'SearchHint', 'HideMs', 'BtnClear', 'Facets', 'BootTestTab', 'BtLabel', 'BtnBtArm', 'BtnBtCancel', 'BtnBtRestart', 'BtState', 'BtnBtRefresh', 'BtGrid', 'BtnBtCompare', 'BtCompare', 'BtnExport','BtnRescan', 'Banner', 'Grid', 'Detail', 'BtnLoc', 'BtnFile', 'BtnVt', 'BtnWeb', 'BtnCopy', 'BtnToggle', 'BtnDelete', 'BootGrid', 'DelayGrid', 'Tabs', 'UndoTab', 'UndoNote', 'UndoGrid', 'BtnUndoSel', 'BtnUndoFolder', 'BtnUndoRefresh', 'Status') { $ui[$n] = $win.FindName($n) }
     $state = @{ Scan = $Scan; Job = $null }
 
     $bc = New-Object Windows.Media.BrushConverter
@@ -2195,20 +2679,137 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
         return $b
     }
 
+    # ---- filter sidebar: each list shows what was found with counts; counts follow the other filters ----
+    $facetOrder = @('Status', 'Risk', 'Category', 'Publisher', 'Signature', 'Running', 'Scope')
+    $facetTitles = @{ Status = 'Status'; Risk = 'Risk'; Category = 'Category'; Publisher = 'Publisher'; Signature = 'Signature'; Running = 'Running now'; Scope = 'Applies to' }
+    $facetFixed = @{ Status = @('On', 'Off', 'Removed'); Risk = @('Flagged', 'High', 'Medium', 'Low', 'OK'); Signature = @('Signed', 'Unsigned', 'Bad signature', "Couldn't check", 'File missing', 'No file to check'); Running = @('Running now', 'Not running') }
+    $facetLabels = @{ Flagged = 'Flagged (high + medium)'; On = 'On (starts automatically)'; Off = 'Off (disabled)' }
+    $state.Filter = @{}; $state.Lists = @{}; $state.Updating = $false
+    foreach ($f in $facetOrder) {
+        $state.Filter[$f] = '*'
+        $h = New-Object Windows.Controls.TextBlock
+        $h.Text = $facetTitles[$f].ToUpper(); $h.Foreground = $bc.ConvertFrom('#8B93A5'); $h.FontSize = 11; $h.FontWeight = 'SemiBold'; $h.Margin = '6,10,0,3'
+        [void]$ui.Facets.Children.Add($h)
+        $lb = New-Object Windows.Controls.ListBox
+        $lb.ItemTemplate = $win.Resources['FacetItem']; $lb.Tag = $f
+        if ($f -in 'Category', 'Publisher') { $lb.MaxHeight = 220 }
+        $lb.Add_SelectionChanged({
+                param($s, $e)
+                if ($state.Updating) { return }
+                $entry = $s.SelectedItem
+                if ($entry) { $state.Filter[$s.Tag] = $entry.Key; & $applyFilter }
+            })
+        [void]$ui.Facets.Children.Add($lb)
+        $state.Lists[$f] = $lb
+    }
+    $updateFacets = {
+        param($counts)
+        $state.Updating = $true
+        try {
+            foreach ($f in $facetOrder) {
+                $c = $counts[$f]
+                if ($f -eq 'Risk') { $c['Flagged'] = [int]$c['High'] + [int]$c['Medium'] }
+                $keys = if ($facetFixed.ContainsKey($f)) { $facetFixed[$f] } else { @($c.Keys | Where-Object { $_ -ne '*' } | Sort-Object @{ E = { [int]$c[$_] }; Descending = $true }, @{ E = { $_ } }) }
+                $selKey = $state.Filter[$f]
+                $entries = New-Object System.Collections.ArrayList
+                [void]$entries.Add([pscustomobject]@{ Key = '*'; Label = 'All'; Count = [int]$c['*'] })
+                foreach ($k in $keys) {
+                    $n = [int]$c[$k]
+                    if ($n -eq 0 -and $k -ne $selKey) { continue }
+                    [void]$entries.Add([pscustomobject]@{ Key = $k; Label = $(if ($facetLabels.ContainsKey($k)) { $facetLabels[$k] } else { $k }); Count = $n })
+                }
+                $pick = $null; foreach ($en in $entries) { if ($en.Key -eq $selKey) { $pick = $en } }
+                if (-not $pick) { $pick = [pscustomobject]@{ Key = $selKey; Label = $selKey; Count = 0 }; [void]$entries.Add($pick) }
+                $state.Lists[$f].ItemsSource = $entries
+                $state.Lists[$f].SelectedItem = $pick
+            }
+        } finally { $state.Updating = $false }
+    }
     $applyFilter = {
         $s = $state.Scan; if (-not $s) { return }
-        $q = $ui.Search.Text; $cat = [string]$ui.Cat.SelectedItem
-        $list = New-Object System.Collections.ArrayList
+        $q = $ui.Search.Text; $hide = [bool]$ui.HideMs.IsChecked
+        $shown = New-Object System.Collections.ArrayList
+        $counts = @{}; foreach ($f in $facetOrder) { $counts[$f] = @{ '*' = 0 } }
         foreach ($it in $s.Items) {
-            if ($ui.HideMs.IsChecked -and $it.IsMicrosoft -and $it.Risk -eq 'OK') { continue }
-            if ($ui.FlagOnly.IsChecked -and $it.Risk -notin 'High', 'Medium') { continue }
-            if ($cat -and $cat -ne 'All categories' -and $it.Category -ne $cat) { continue }
+            if ($hide -and $it.IsMicrosoft -and $it.Risk -eq 'OK') { continue }
             if ($q -and "$($it.Name) $($it.ImagePath) $($it.Publisher) $($it.Command) $($it.Location)" -notlike "*$q*") { continue }
-            [void]$list.Add($it)
+            $keys = Get-PssFacetKeys $it
+            $nf = 0; $failed = ''
+            foreach ($f in $facetOrder) {
+                $want = $state.Filter[$f]
+                if ($want -eq '*') { continue }
+                $ok = if ($f -eq 'Risk' -and $want -eq 'Flagged') { $keys.Risk -in 'High', 'Medium' } else { $keys[$f] -eq $want }
+                if (-not $ok) { $nf++; $failed = $f; if ($nf -gt 1) { break } }
+            }
+            if ($nf -eq 0) { [void]$shown.Add($it) }
+            if ($nf -le 1) {
+                # an item counts towards a list when it passes every OTHER filter
+                foreach ($f in $facetOrder) {
+                    if ($nf -eq 1 -and $f -ne $failed) { continue }
+                    $c = $counts[$f]; $c['*'] = [int]$c['*'] + 1
+                    $k = [string]$keys[$f]; $c[$k] = [int]$c[$k] + 1
+                }
+            }
         }
-        $ui.Grid.ItemsSource = $list
-        $ui.Status.Text = "Showing $($list.Count) of $($s.Items.Count) items  -  scanned in {0:N1}s at {1:HH:mm:ss}" -f $s.Duration, $s.ScannedAt
+        $ui.Grid.ItemsSource = $shown
+        & $updateFacets $counts
+        $active = @($facetOrder | Where-Object { $state.Filter[$_] -ne '*' } | ForEach-Object { '{0}: {1}' -f $facetTitles[$_], $(if ($facetLabels.ContainsKey($state.Filter[$_])) { $facetLabels[$state.Filter[$_]] } else { $state.Filter[$_] }) })
+        if ($q) { $active += "search: $q" }
+        $ui.Status.Text = "Showing $($shown.Count) of $($s.Items.Count) items" + $(if ($active) { '  -  ' + ($active -join ', ') } else { '' }) + ("  -  scanned in {0:N1}s at {1:HH:mm:ss}" -f $s.Duration, $s.ScannedAt)
     }
+    $clearFilters = {
+        foreach ($f in $facetOrder) { $state.Filter[$f] = '*' }
+        if ($ui.Search.Text) { $ui.Search.Text = '' } else { & $applyFilter }
+    }
+
+    # ---- boot tests tab ----
+    $loadBootTests = {
+        $tests = @(Get-PssBootTests)
+        $ui.BtGrid.ItemsSource = $tests
+        $st = Get-PssBootTestState
+        $ui.BtState.Text = $(if ($st) { "Ready: '$($st.Label)'. Restart and sign in to run it." } else { '' })
+        $ui.BtnBtCancel.IsEnabled = [bool]$st
+        if (-not $ui.BtLabel.Text) { $ui.BtLabel.Text = $(if ($tests) { 'After changes' } else { 'Before changes' }) }
+        $ui.BootTestTab.Header = $(if ($tests) { "Boot tests ($($tests.Count))" } else { 'Boot tests' })
+    }
+    $ui.BtnBtArm.Add_Click({
+            $r = Start-PssBootTest $ui.BtLabel.Text
+            $ui.Status.Text = $r.Message
+            & $loadBootTests
+            if (-not $r.Ok) { [void][Windows.MessageBox]::Show($win, $r.Message, 'PAX Startup Scanner', 'OK', 'Error'); return }
+            $q = "$($r.Message)`n`nRestart now? Save your work first. Windows restarts 15 seconds after you choose Yes."
+            if ([string][Windows.MessageBox]::Show($win, $q, 'PAX Startup Scanner', 'YesNo', 'Question') -eq 'Yes') { $ui.Status.Text = (Restart-PssNow).Message }
+        })
+    $ui.BtnBtCancel.Add_Click({ $ui.Status.Text = (Stop-PssBootTest).Message; & $loadBootTests })
+    $ui.BtnBtRefresh.Add_Click({ & $loadBootTests })
+    $ui.BtnBtRestart.Add_Click({
+            if ([string][Windows.MessageBox]::Show($win, 'Restart the PC now? Save your work first. Windows restarts 15 seconds after you choose Yes.', 'PAX Startup Scanner', 'YesNo', 'Warning') -eq 'Yes') { $ui.Status.Text = (Restart-PssNow).Message }
+        })
+    $ui.BtnBtCompare.Add_Click({
+            $all = @($ui.BtGrid.ItemsSource | Sort-Object Boot)
+            $picked = @($ui.BtGrid.SelectedItems | ForEach-Object { $_ } | Sort-Object Boot)
+            $old = $null; $new = $null
+            if ($picked.Count -ge 2) { $old = $picked[0]; $new = $picked[-1] }
+            elseif ($picked.Count -eq 1) {
+                $i = [array]::IndexOf($all, $picked[0])
+                if ($i -gt 0) { $old = $all[$i - 1]; $new = $picked[0] } elseif ($all.Count -ge 2) { $old = $picked[0]; $new = $all[1] }
+            } elseif ($all.Count -ge 2) { $old = $all[-2]; $new = $all[-1] }
+            if (-not $old) { $ui.BtCompare.Text = 'Two timed restarts are needed for a comparison.'; return }
+            $ui.BtCompare.Text = ((Compare-PssBootTests $old $new) | ForEach-Object { $_.Text }) -join "`r`n"
+        })
+
+    # ---- right-click a row to filter by it ----
+    $cm = New-Object Windows.Controls.ContextMenu
+    $mkItem = {
+        param([string]$Text, [scriptblock]$Do)
+        $mi = New-Object Windows.Controls.MenuItem; $mi.Header = $Text; $mi.Add_Click($Do); [void]$cm.Items.Add($mi)
+    }
+    & $mkItem 'Show only this publisher' { $it = & $sel; if ($it) { $state.Filter['Publisher'] = $it.Vendor; & $applyFilter } }
+    & $mkItem 'Show only this category' { $it = & $sel; if ($it) { $state.Filter['Category'] = $it.Category; & $applyFilter } }
+    & $mkItem 'Show only items that are on' { $state.Filter['Status'] = 'On'; & $applyFilter }
+    & $mkItem 'Show only flagged items' { $state.Filter['Risk'] = 'Flagged'; & $applyFilter }
+    & $mkItem 'Clear filters' { & $clearFilters }
+    $ui.Grid.ContextMenu = $cm
 
     $load = {
         $s = $state.Scan
@@ -2219,11 +2820,8 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
         [void]$ui.Tiles.Children.Add((& $makeTile @($s.Items | Where-Object Risk -eq 'High').Count 'high risk' '#FF7B7B'))
         [void]$ui.Tiles.Children.Add((& $makeTile @($s.Items | Where-Object Risk -eq 'Medium').Count 'medium risk' '#FBBF24'))
         [void]$ui.Tiles.Children.Add((& $makeTile $(if ($s.Boot.LastBootMs) { '{0:N1}s' -f ($s.Boot.LastBootMs / 1000) } else { 'n/a' }) $(if ($s.Boot.LastBootTime) { 'last boot, {0:MMM d}' -f $s.Boot.LastBootTime } else { 'last boot' }) '#38BDF8'))
-        $cats = @('All categories') + @($s.Items | ForEach-Object Category | Sort-Object -Unique)
-        $prev = $ui.Cat.SelectedItem
-        $ui.Cat.ItemsSource = $cats
-        $ui.Cat.SelectedItem = $(if ($prev -and $cats -contains $prev) { $prev } else { 'All categories' })
         $notes = @()
+        if ($script:PssReadOnly) { $notes += 'Read-only mode: nothing on this PC is written or changed (Disable, Delete, Undo, boot tests and export are off).' }
         if (-not $s.IsAdmin) { $notes += 'Not elevated: services, tasks, WMI and boot history may be incomplete. Run from an elevated PowerShell for full results.' }
         if ($s.NotLoadedProfiles) { $notes += 'Users not logged on (Run keys not read): ' + ($s.NotLoadedProfiles -join ', ') }
         $notes += $s.Errors
@@ -2252,23 +2850,36 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
             $ui.SearchHint.Visibility = $(if ($ui.Search.Text) { 'Collapsed' } else { 'Visible' })
             & $applyFilter
         })
-    $ui.Cat.Add_SelectionChanged({ & $applyFilter })
     $ui.HideMs.Add_Click({ & $applyFilter })
-    $ui.FlagOnly.Add_Click({ & $applyFilter })
-    $ui.BtnLoc.Add_Click({ $it = & $sel; if ($it) { Open-PssLocation $it } })
+    $ui.BtnClear.Add_Click({ & $clearFilters })
+    $ui.BtnLoc.Add_Click({ $it = & $sel; if ($it) { $script:PssLastNote = ''; Open-PssLocation $it; if ($script:PssLastNote) { $ui.Status.Text = $script:PssLastNote } } })
     $ui.BtnFile.Add_Click({ $it = & $sel; if ($it) { Open-PssFolder $it } })
     $ui.BtnWeb.Add_Click({ $it = & $sel; if ($it) { Open-PssWebSearch $it } })
     $ui.BtnVt.Add_Click({ $it = & $sel; if ($it) { if (Open-PssVirusTotal $it) { $ui.Detail.Text = Get-PssDetailText $it } else { $ui.Status.Text = $script:PssHashError } } })
     $ui.BtnCopy.Add_Click({ $it = & $sel; if ($it) { [Windows.Clipboard]::SetText((Get-PssDetailText $it)); $ui.Status.Text = 'Details copied to clipboard.' } })
-    $ui.Grid.Add_MouseDoubleClick({ $it = & $sel; if ($it) { Open-PssLocation $it } })
+    $ui.Grid.Add_MouseDoubleClick({ $it = & $sel; if ($it) { $script:PssLastNote = ''; Open-PssLocation $it; if ($script:PssLastNote) { $ui.Status.Text = $script:PssLastNote } } })
+    $exportTo = {
+        param([bool]$ShownOnly)
+        if ($script:PssReadOnly) { $ui.Status.Text = 'Read-only mode: reports are not saved. Copy details instead, or run without -ReadOnly.'; return }
+        $d = New-Object Microsoft.Win32.SaveFileDialog
+        $d.Filter = 'HTML report|*.html|CSV|*.csv|JSON|*.json'
+        $d.FileName = 'PAX-Startup-{0}-{1:yyyyMMdd-HHmm}' -f $state.Scan.Computer, $state.Scan.ScannedAt
+        if (-not $d.ShowDialog($win)) { return }
+        $out = $state.Scan; $note = ''
+        if ($ShownOnly) {
+            $out = $state.Scan.PSObject.Copy()
+            $out.Items = $ui.Grid.ItemsSource.ToArray()
+            $note = ($ui.Status.Text -split '  -  ' | Select-Object -SkipLast 1) -join ' - '
+        }
+        try { Export-PssReport $out $d.FileName $note; $ui.Status.Text = "Saved $($d.FileName)"; if ($d.FileName -match '\.html$') { Start-Process $d.FileName } }
+        catch { [void][Windows.MessageBox]::Show($win, "Could not save: $($_.Exception.Message)", 'PAX Startup Scanner', 'OK', 'Error') }
+    }
     $ui.BtnExport.Add_Click({
-            $d = New-Object Microsoft.Win32.SaveFileDialog
-            $d.Filter = 'HTML report|*.html|CSV|*.csv|JSON|*.json'
-            $d.FileName = 'PAX-Startup-{0}-{1:yyyyMMdd-HHmm}' -f $state.Scan.Computer, $state.Scan.ScannedAt
-            if ($d.ShowDialog($win)) {
-                try { Export-PssReport $state.Scan $d.FileName; $ui.Status.Text = "Saved $($d.FileName)"; if ($d.FileName -match '\.html$') { Start-Process $d.FileName } }
-                catch { [Windows.MessageBox]::Show("Could not save: $($_.Exception.Message)") | Out-Null }
-            }
+            $m = New-Object Windows.Controls.ContextMenu
+            $a = New-Object Windows.Controls.MenuItem; $a.Header = "All items ($($state.Scan.Items.Count))..."; $a.Add_Click({ & $exportTo $false })
+            $b = New-Object Windows.Controls.MenuItem; $b.Header = "Only the $($ui.Grid.Items.Count) items shown now..."; $b.Add_Click({ & $exportTo $true })
+            [void]$m.Items.Add($a); [void]$m.Items.Add($b)
+            $m.PlacementTarget = $ui.BtnExport; $m.Placement = 'Bottom'; $m.IsOpen = $true
         })
 
     $loadUndo = {
@@ -2281,13 +2892,16 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
     $doChange = {
         param([string]$Action)
         $it = & $sel; if (-not $it) { return }
-        $icon = if ($Action -eq 'Delete') { 'Warning' } else { 'Question' }
-        $answer = [Windows.MessageBox]::Show($win, (Get-PssConfirmText $it $Action), 'PAX Startup Scanner', 'YesNo', $icon)
-        if ([string]$answer -ne 'Yes') { return }
+        # Disable/Enable are reversible and happen straight away; only Delete asks first
+        if ($Action -eq 'Delete') {
+            $answer = [Windows.MessageBox]::Show($win, (Get-PssConfirmText $it $Action), 'PAX Startup Scanner', 'YesNo', 'Warning')
+            if ([string]$answer -ne 'Yes') { return }
+        }
         $res = Invoke-PssChange $it $Action
-        $ui.Status.Text = $res.Message
         if (-not $res.Ok) { [void][Windows.MessageBox]::Show($win, $res.Message, 'PAX Startup Scanner', 'OK', 'Error') }
-        $ui.Grid.Items.Refresh()
+        & $applyFilter
+        if ($ui.Grid.Items.Contains($it)) { $ui.Grid.SelectedItem = $it; $ui.Grid.ScrollIntoView($it) }
+        $ui.Status.Text = $res.Message + $(if ($res.Ok -and $Action -ne 'Delete') { '  (Undo changes can reverse it.)' } else { '' })
         $ui.Detail.Text = Get-PssDetailText $it
         & $updateButtons
         & $loadUndo
@@ -2330,6 +2944,7 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
         $sync = [hashtable]::Synchronized(@{ Stage = 'Starting...'; Pct = 0 })
         $rs = [runspacefactory]::CreateRunspace($iss); $rs.Open()
         $rs.SessionStateProxy.SetVariable('PssVersion', $script:PssVersion)
+        $rs.SessionStateProxy.SetVariable('PssReadOnly', [bool]$script:PssReadOnly)
         $ps = [powershell]::Create(); $ps.Runspace = $rs
         [void]$ps.AddScript('param($s) Invoke-PssScan -Status $s').AddArgument($sync)
         $state.Job = @{ PS = $ps; RS = $rs; Sync = $sync; Handle = $ps.BeginInvoke() }
@@ -2339,6 +2954,12 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
 
     & $load
     & $loadUndo
+    & $loadBootTests
+    # Size to the screen (90% of the work area, within sensible limits)
+    try {
+        $wa = [Windows.SystemParameters]::WorkArea
+        $win.Width = [Math]::Max(1000, [Math]::Min(1500, $wa.Width * 0.92)); $win.Height = [Math]::Max(600, [Math]::Min(940, $wa.Height * 0.92))
+    } catch {}
     if ($Snapshot) {
         # Lay the window content out without ever showing a window, then save it as a PNG
         $root = $win.Content; $win.Content = $null
@@ -2349,15 +2970,16 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
         [Windows.Documents.TextElement]::SetFontFamily($wrap, $win.FontFamily)
         [Windows.Documents.TextElement]::SetFontSize($wrap, $win.FontSize)
         $wrap.Child = $root
-        $size = New-Object Windows.Size 1280, 800
+        $size = New-Object Windows.Size 1440, 860
         $wrap.Measure($size); $wrap.Arrange((New-Object Windows.Rect $size)); $wrap.UpdateLayout()
         if ($ui.Grid.Items.Count) { $ui.Grid.SelectedIndex = 0; $wrap.UpdateLayout() }
         if ($SnapshotTab) {
             $ui.Tabs.SelectedIndex = $SnapshotTab
             if ($ui.UndoGrid.Items.Count) { $ui.UndoGrid.SelectedIndex = 0 }
+            if ($ui.BtGrid.Items.Count -ge 2) { $ui.BtnBtCompare.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent))) }
             $wrap.Measure($size); $wrap.Arrange((New-Object Windows.Rect $size)); $wrap.UpdateLayout()
         }
-        $bmp = New-Object Windows.Media.Imaging.RenderTargetBitmap 1280, 800, 96, 96, ([Windows.Media.PixelFormats]::Pbgra32)
+        $bmp = New-Object Windows.Media.Imaging.RenderTargetBitmap 1440, 860, 96, 96, ([Windows.Media.PixelFormats]::Pbgra32)
         $bmp.Render($wrap)
         $enc = New-Object Windows.Media.Imaging.PngBitmapEncoder
         $enc.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($bmp))
@@ -2373,13 +2995,15 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
 # ======================================================================================
 
 function Start-PaxStartupScanner {
-    param([switch]$Gui, [switch]$Report, [string]$Export)
+    param([switch]$Gui, [switch]$Report, [string]$Export, [switch]$ReadOnly)
     # Run the same way whatever the technician's profile sets (these only apply inside this call)
     Set-StrictMode -Off
     $ErrorActionPreference = 'Continue'
     $ProgressPreference = 'SilentlyContinue'
+    $script:PssReadOnly = [bool]$ReadOnly -or $env:PSS_READONLY -in '1', 'true', 'yes'
     $script:PssEof = $false
     $script:PssShowMicrosoft = $false
+    $script:PssOnlyEnabled = $false
     if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
         Write-Host '  This is 32-bit PowerShell; results would be incomplete. Use the normal 64-bit PowerShell.' -ForegroundColor Red
         return
@@ -2403,4 +3027,4 @@ function Start-PaxStartupScanner {
     Start-PssConsole $scan
 }
 
-Start-PaxStartupScanner -Gui:$Gui -Report:$Report -Export $Export
+Start-PaxStartupScanner -Gui:$Gui -Report:$Report -Export $Export -ReadOnly:$ReadOnly

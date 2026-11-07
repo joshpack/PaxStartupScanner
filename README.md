@@ -1,6 +1,6 @@
 # PAX Startup Scanner
 
-Finds everything that starts with Windows: what each item is, where it lives, who signed it, whether it looks suspicious, and what is slowing the machine down. You can then disable or delete what shouldn't be there. Every change is backed up and can be undone.
+Finds everything that starts with Windows: what each item is, where it lives, who signed it, whether it looks suspicious, and what is slowing the machine down. You can filter the results by status, risk, category, publisher, signature and more. You can disable or delete what shouldn't be there, and every change is backed up and can be undone. You can also time a restart before and after your changes to see whether they helped.
 
 It is one PowerShell script with nothing to install, so you can run it straight from GitHub on any machine you are fixing.
 
@@ -14,7 +14,16 @@ Open **PowerShell as Administrator** and paste:
 irm https://raw.githubusercontent.com/joshpack/PaxStartupScanner/main/PaxStartupScanner.ps1 | iex
 ```
 
-That's it. The script runs in memory and installs nothing. The only files it writes are the backups of changes you choose to make (see [Removing startup items](#removing-startup-items)) and any report you export.
+That's it. The script runs in memory and installs nothing. It writes files only for things you choose to do:
+- backups of changes (see [Removing startup items](#removing-startup-items))
+- boot tests (see [Boot tests](#boot-tests))
+- reports you export
+
+To guarantee it writes nothing at all, use read-only mode:
+
+```powershell
+$env:PSS_READONLY = '1'; irm https://raw.githubusercontent.com/joshpack/PaxStartupScanner/main/PaxStartupScanner.ps1 | iex
+```
 
 On older systems where PowerShell doesn't use TLS 1.2 by default (Server 2012 R2/2016, early Windows 10), use:
 
@@ -39,6 +48,7 @@ On older systems where PowerShell doesn't use TLS 1.2 by default (Server 2012 R2
 | `-Gui` | Opens the graphical view instead of the console menu |
 | `-Report` | Scans, prints the summary and flagged items, then returns (good for remote shells and scripts) |
 | `-Export <path>` | Saves a report after scanning. Use `.html` (self-contained, filterable), `.csv` or `.json` |
+| `-ReadOnly` | Look only. Nothing on the PC is written or changed (same as `$env:PSS_READONLY = '1'`) |
 
 A downloaded copy runs the same way: `powershell -ExecutionPolicy Bypass -File .\PaxStartupScanner.ps1`
 
@@ -50,10 +60,12 @@ The dashboard shows the risk summary, where things start from, boot times and th
 |---|---|
 | `1` | Review flagged items (high and medium risk) |
 | `2` | All third-party startup items |
-| `3` | Browse by category |
-| `4` | Everything, including Microsoft items |
-| `5` | Search by name, file, publisher, command or location |
-| `6` | Boot performance: recent boot times, what Windows says slowed boot, memory use right now |
+| `3` | Everything, including Microsoft items |
+| `4` | Browse by category: each category with its item, on, off and flagged counts |
+| `5` | Browse by publisher (manufacturer), with the same counts |
+| `6` | Search by name, file, publisher, command or location |
+| `7` | Boot times and boot tests: time a restart, compare tests, and see what Windows' own boot log recorded |
+| `A` | Show only items that are on (applies to every list) |
 | `E` | Export an HTML / CSV / JSON report |
 | `G` | Open the GUI with the same results |
 | `M` | Include clean Microsoft items when browsing and searching |
@@ -74,7 +86,7 @@ The details view shows the item's command, the resolved file, its signature, pub
 - **D**: disable the item at startup (or enable it again).
 - **X**: delete the startup entry.
 
-Both **D** and **X** ask you to confirm first. The details view also shows which changes the item allows.
+**D** acts straight away, because disabling can always be reversed. **X** asks you to confirm first. The details view also shows which changes the item allows.
 
 ![Item details](docs/screenshots/console-details.png)
 
@@ -82,21 +94,61 @@ Both **D** and **X** ask you to confirm first. The details view also shows which
 
 ## The GUI
 
-Press `G` from the menu or run with `-Gui`. The GUI is a single lightweight window. It has:
-- search, a category filter and a "hide clean Microsoft items" switch
-- a details pane with **Disable** and **Delete** buttons
-- a boot-performance tab
-- an **Undo changes** tab
+Press `G` from the menu or run with `-Gui`. The GUI is a single lightweight window with four tabs: **Startup items**, **Boot tests**, **Boot performance** (Windows' own log) and **Undo changes**.
 
-Hover over a greyed-out button to see why an item can't be changed. Rescans run in the background, so the window stays responsive.
+The **filter sidebar** on the Startup items tab lists everything that was found, with counts:
+- **Status:** on / off / removed
+- **Risk**
+- **Category**
+- **Publisher** (manufacturer)
+- **Signature:** signed / unsigned / file missing
+- **Running now**
+- **Applies to:** the whole machine or a particular user
+
+Click any entry to narrow the list. Filters combine, and each list's counts update to show what's left. For example, pick "Unsigned" and the Category list shows how many unsigned items each category has.
+
+Other ways to narrow things down:
+- **Search box and "Hide clean Microsoft items":** work together with the sidebar.
+- **Right-click a row:** "Show only this publisher", "Show only this category", "Show only items that are on", "Show only flagged items".
+- **Clear filters:** resets everything.
+- **Export report:** saves all items, or only the ones currently shown.
+
+The details pane has **Disable** and **Delete** buttons. Hover over a greyed-out button to see why that item can't be changed. Rescans run in the background, so the window stays responsive.
 
 ![GUI](docs/screenshots/gui.png)
 
 ![Undo changes](docs/screenshots/gui-undo.png)
 
+## Boot tests
+
+To see whether your changes actually made Windows start faster:
+
+1. **Time the next restart.** Name the test (for example "Before changes") and restart. Use **Restart**, not Shut down, because Fast Startup skips a real boot.
+2. Sign in as usual. The scanner times two phases:
+   - **Start-up:** power-on until Windows is idle at the sign-in screen.
+   - **Sign-in:** sign-in until the desktop is idle (CPU under 20% and the disk mostly idle for 10 seconds).
+
+   Time spent typing your password is not counted. It also notes which programs used the most CPU after sign-in.
+3. Make your changes, time another restart ("After changes"), then select both tests and choose **Compare**. The comparison shows:
+   - each phase and the total, as faster or slower in seconds and percent
+   - every change you made with the scanner between the two tests
+   - the busiest programs before and after
+
+![Boot tests](docs/screenshots/gui-boot-tests.png)
+
+How the timing works:
+- It needs an elevated PowerShell.
+- It uses two one-time scheduled tasks under `\PAX Startup Scanner\`. They run a small probe saved at `C:\ProgramData\PaxStartupScanner\boot-probe.ps1`, write the result to `C:\ProgramData\PaxStartupScanner\BootTests`, then remove the tasks and the probe.
+- You can cancel a test that hasn't run yet.
+- Start-up times naturally vary by a few seconds, so time two or three restarts each way for a fair comparison.
+
+In the console it's under `7`: **T** times the next restart, **V** compares two tests, **C** cancels, **S** restarts.
+
+Windows' own boot log (Diagnostics-Performance) is still shown too. Windows doesn't record every boot, though; on some PCs the newest entry is months old.
+
 ## Removing startup items
 
-There are two ways to stop something starting. Both ask you to confirm first.
+There are two ways to stop something starting. **Disable** happens straight away, because it can always be reversed. **Delete** asks you to confirm first.
 
 **Disable** is the gentle option and can be reversed. The item stays installed but no longer starts automatically. It uses the same switches Windows uses:
 
@@ -199,7 +251,13 @@ Matching takes some care:
 
 ## Safety and privacy
 
-- **Changes only what you confirm.** Scanning never changes anything. Startup items are only changed when you choose Disable or Delete and confirm. Every change is backed up first and can be undone. The only other write is the same one Autoruns makes: **O** on a registry item sets Regedit's "last key" so Regedit opens at that key.
+- **Changes only what you ask for.** Scanning never changes anything. Startup items change only when you choose Disable, or Delete and confirm. Every change is backed up first and can be undone. Boot tests add two one-time scheduled tasks that remove themselves. The only other write is the same one Autoruns makes: **O** on a registry item sets Regedit's "last key" so Regedit opens at that key.
+- **Read-only mode writes nothing.** With `-ReadOnly` or `$env:PSS_READONLY = '1'`, the following are all switched off:
+  - Disable, Delete and Undo
+  - boot tests and Restart
+  - Export (an explicit `-Export` path is still honoured)
+
+  **O** copies the registry path to the clipboard instead of setting Regedit's last key. The only traces left are ones outside the script's control: PowerShell's own command history, and any script-block or process logging your organization has turned on in Windows.
 - **Nothing leaves the machine.** No telemetry and no uploads. **V** opens a VirusTotal page for the file's SHA-256 hash in the browser. The file itself is never uploaded. **S** opens a web search for the file name. Both happen only when you press the key.
 - **Exports are saved only where you choose.**
 
