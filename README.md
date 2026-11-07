@@ -4,6 +4,8 @@ Finds everything that starts with Windows: what each item is, where it lives, wh
 
 It is one PowerShell script with nothing to install, so you can run it straight from GitHub on any machine you are fixing.
 
+It works with [PAX Toolkit](https://github.com/joshpack/PaxToolkit): it can be turned on and run from there.
+
 ![Console dashboard](docs/screenshots/console-dashboard.png)
 
 ## Run it
@@ -24,6 +26,7 @@ That's it. The script runs in memory and installs nothing. It writes files only 
 - backups of changes (see [Removing startup items](#removing-startup-items))
 - boot tests (see [Boot tests](#boot-tests))
 - reports you export
+- the GUI window's size and position, in `%APPDATA%\PaxStartupScanner\window.json`
 
 To guarantee it writes nothing at all, use read-only mode:
 
@@ -121,6 +124,8 @@ Other ways to narrow things down:
 - **Export report:** saves all items, or only the ones currently shown.
 
 The details pane has **Disable** and **Delete** buttons. Hover over a greyed-out button to see why that item can't be changed. Rescans run in the background, so the window stays responsive.
+
+The window has its own dark title bar, like every PAX app: drag it to move, double-click to maximize, and Windows snap and edge resizing still work. Questions and errors use the same style. The window opens where you left it last time (size, position and maximized), unless that spot is no longer on any screen.
 
 ![GUI](docs/screenshots/gui.png)
 
@@ -276,6 +281,7 @@ Matching takes some care:
   - Disable, Delete and Undo
   - boot tests and Restart
   - Export (an explicit `-Export` path is still honoured)
+  - saving the GUI window's position
 
   **O** copies the registry path to the clipboard instead of setting Regedit's last key. The only traces left are ones outside the script's control: PowerShell's own command history, and any script-block or process logging your organization has turned on in Windows.
 - **Nothing leaves the machine.** No telemetry and no uploads. **V** opens a VirusTotal page for the file's SHA-256 hash in the browser. The file itself is never uploaded. **S** opens a web search for the file name. Both happen only when you press the key.
@@ -293,4 +299,10 @@ Matching takes some care:
 
 ```powershell
 powershell -STA -ExecutionPolicy Bypass -File tools\Render-Screenshots.ps1
+```
+
+`tools/Test-Window.ps1` checks the title bar and the remembered window position off-screen, using a temporary settings folder (`PSS_CONFIG_DIR`):
+
+```powershell
+powershell -STA -ExecutionPolicy Bypass -File tools\Test-Window.ps1
 ```

@@ -39,7 +39,7 @@ param(
     [switch]$ReadOnly
 )
 
-$script:PssVersion = '1.4.0'
+$script:PssVersion = '1.5.0'
 $script:PssUrl     = 'https://raw.githubusercontent.com/joshpack/PaxStartupScanner/main/PaxStartupScanner.ps1'
 $script:PssSelfPath = $PSCommandPath   # empty when run through irm | iex
 
@@ -2625,6 +2625,232 @@ function Set-PssAppId {
     [void][Pss.Shell]::SetCurrentProcessExplicitAppUserModelID('Pax.StartupScanner')
 }
 
+# ---- PAX App Standard: own title bar on every window, remembered window placement ----
+$script:PssAppId = 'PaxStartupScanner'
+$script:PssGlyphMax = 'M0.5,0.5 L9.5,0.5 L9.5,9.5 L0.5,9.5 Z'
+$script:PssGlyphRestore = 'M2.5,0.5 L9.5,0.5 L9.5,7.5 M0.5,2.5 L7.5,2.5 L7.5,9.5 L0.5,9.5 Z'
+
+function Get-PssChromeXaml([switch]$Styles, [switch]$Resizable, [switch]$NoMinimize) {
+    # -Styles: the caption-button styles for Window.Resources; otherwise the 38 px title bar itself
+    # (icon + name on the left, minimize / maximize (resizable only) / close on the right)
+    if ($Styles) {
+        return @'
+    <Style x:Key="Caption" TargetType="Button">
+      <Setter Property="Width" Value="46"/><Setter Property="Height" Value="38"/><Setter Property="Foreground" Value="#C9CED9"/>
+      <Setter Property="Focusable" Value="False"/><Setter Property="WindowChrome.IsHitTestVisibleInChrome" Value="True"/>
+      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
+        <Border x:Name="b" Background="Transparent"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
+        <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="Background" Value="#1F2533"/></Trigger></ControlTemplate.Triggers>
+      </ControlTemplate></Setter.Value></Setter>
+    </Style>
+    <Style x:Key="CaptionClose" TargetType="Button" BasedOn="{StaticResource Caption}">
+      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
+        <Border x:Name="b" Background="Transparent"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
+        <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="Background" Value="#E81123"/><Setter Property="Foreground" Value="#FFFFFF"/></Trigger></ControlTemplate.Triggers>
+      </ControlTemplate></Setter.Value></Setter>
+    </Style>
+    <Style x:Key="CaptionGlyph" TargetType="Path">
+      <Setter Property="Width" Value="10"/><Setter Property="Height" Value="10"/><Setter Property="StrokeThickness" Value="1"/><Setter Property="SnapsToDevicePixels" Value="True"/>
+      <Setter Property="Stroke" Value="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
+    </Style>
+'@
+    }
+    $min = if ($NoMinimize) { '' } else { '<Button x:Name="CapMin" Style="{StaticResource Caption}" ToolTip="Minimize"><Path Style="{StaticResource CaptionGlyph}" Data="M0,5.5 L10,5.5"/></Button>' }
+    $max = if ($Resizable) { '<Button x:Name="CapMax" Style="{StaticResource Caption}" ToolTip="Maximize"><Path x:Name="CapMaxGlyph" Style="{StaticResource CaptionGlyph}" Data="' + $script:PssGlyphMax + '"/></Button>' } else { '' }
+    return @"
+  <Border DockPanel.Dock="Top" BorderBrush="#1B2030" BorderThickness="0,0,0,1">
+  <Grid Height="38" Background="#0A0D12">
+    <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="12,0,0,0">
+      <Image x:Name="TitleIcon" Width="18" Height="18" Margin="0,0,9,0" RenderOptions.BitmapScalingMode="HighQuality"/>
+      <TextBlock x:Name="TitleText" Text="PAX Startup Scanner" FontSize="12.5" FontWeight="SemiBold" Foreground="#C9CED9" VerticalAlignment="Center"/>
+      <TextBlock x:Name="TitleVer" FontSize="12" Foreground="#6B7385" Margin="8,0,0,0" VerticalAlignment="Center"/>
+    </StackPanel>
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Top">
+      $min$max<Button x:Name="CapClose" Style="{StaticResource CaptionClose}" ToolTip="Close"><Path Style="{StaticResource CaptionGlyph}" Data="M0,0 L10,10 M10,0 L0,10"/></Button>
+    </StackPanel>
+  </Grid>
+  </Border>
+"@
+}
+
+function Initialize-PssChrome($Win) {
+    # Wires the title bar from Get-PssChromeXaml. Handlers use the sender, not captured variables,
+    # because they run after this function has returned. Dragging, double-click to maximize, snap and
+    # edge resizing come from WindowChrome itself.
+    try { $icon = New-PssIcon 64; $Win.Icon = $icon; $t = $Win.FindName('TitleIcon'); if ($t) { $t.Source = $icon } } catch {}
+    $b = $Win.FindName('CapMin')
+    if ($b) { $b.Add_Click({ param($s) ([Windows.Window]::GetWindow($s)).WindowState = 'Minimized' }) }
+    $b = $Win.FindName('CapMax')
+    if ($b) { $b.Add_Click({ param($s) $w = [Windows.Window]::GetWindow($s); $w.WindowState = $(if ($w.WindowState -eq 'Maximized') { 'Normal' } else { 'Maximized' }) }) }
+    $Win.FindName('CapClose').Add_Click({ param($s) ([Windows.Window]::GetWindow($s)).Close() })
+    $apply = {
+        param($w)
+        $root = $w.FindName('RootBorder'); $cap = $w.FindName('CapMax'); $glyph = $w.FindName('CapMaxGlyph')
+        if ($w.WindowState -eq 'Maximized') {
+            # a borderless maximized window hangs over the screen edges by the resize border
+            $t = [Windows.SystemParameters]::WindowResizeBorderThickness
+            if ($root) { $root.Margin = New-Object Windows.Thickness ($t.Left + 2), ($t.Top + 2), ($t.Right + 2), ($t.Bottom + 2); $root.BorderThickness = 0 }
+            if ($cap) { $cap.ToolTip = 'Restore down'; $glyph.Data = [Windows.Media.Geometry]::Parse('M2.5,0.5 L9.5,0.5 L9.5,7.5 M0.5,2.5 L7.5,2.5 L7.5,9.5 L0.5,9.5 Z') }
+        } else {
+            if ($root) { $root.Margin = 0; $root.BorderThickness = 1 }
+            if ($cap) { $cap.ToolTip = 'Maximize'; $glyph.Data = [Windows.Media.Geometry]::Parse('M0.5,0.5 L9.5,0.5 L9.5,9.5 L0.5,9.5 Z') }
+        }
+    }
+    $Win.Tag = $apply
+    $Win.Add_StateChanged({ param($s) & $s.Tag $s })
+    $Win.Add_SourceInitialized({ param($s) & $s.Tag $s })
+}
+
+function Get-PssConfigDir {
+    # Per-user settings (window placement). $env:PSS_CONFIG_DIR points it elsewhere (tests).
+    if ($env:PSS_CONFIG_DIR) { return $env:PSS_CONFIG_DIR }
+    return (Join-Path ([Environment]::GetFolderPath('ApplicationData')) $script:PssAppId)
+}
+
+function Get-PssScreens {
+    # Each screen's work area in WPF units, so saved positions can be checked against them
+    $out = @()
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $scale = 1.0
+        $px = [Windows.Forms.Screen]::PrimaryScreen.Bounds.Width; $dip = [Windows.SystemParameters]::PrimaryScreenWidth
+        if ($px -gt 0 -and $dip -gt 0) { $scale = $px / $dip }
+        foreach ($s in [Windows.Forms.Screen]::AllScreens) {
+            $a = $s.WorkingArea
+            $out += New-Object Windows.Rect ($a.X / $scale), ($a.Y / $scale), ($a.Width / $scale), ($a.Height / $scale)
+        }
+    } catch {}
+    return $out
+}
+
+function Test-PssPlacementVisible($P, $Screens) {
+    # Usable when a grabbable part of the title bar is on some screen
+    if (-not $P -or [double]$P.Width -le 0) { return $false }
+    $bar = New-Object Windows.Rect ([double]$P.Left), ([double]$P.Top), ([double]$P.Width), 38.0
+    foreach ($s in $Screens) {
+        $i = [Windows.Rect]::Intersect($bar, $s)
+        if (-not $i.IsEmpty -and $i.Width -ge 60 -and $i.Height -ge 20) { return $true }
+    }
+    return $false
+}
+
+function Read-PssPlacement {
+    try {
+        $f = Join-Path (Get-PssConfigDir) 'window.json'
+        if (-not (Test-Path -LiteralPath $f)) { return $null }
+        $p = [IO.File]::ReadAllText($f) | ConvertFrom-Json
+        $r = [pscustomobject]@{ Left = [double]$p.Left; Top = [double]$p.Top; Width = [double]$p.Width; Height = [double]$p.Height; Maximized = [bool]$p.Maximized }
+        if ($r.Width -lt 200 -or $r.Height -lt 150 -or $r.Width -gt 20000 -or $r.Height -gt 20000) { return $null }
+        return $r
+    } catch { return $null }
+}
+
+function Save-PssPlacement($Win) {
+    # Read-only mode writes nothing, so the placement is not saved there
+    if ($script:PssReadOnly) { return $false }
+    try {
+        $b = $Win.RestoreBounds
+        if ($Win.WindowState -eq 'Normal' -or $b.IsEmpty) { $b = New-Object Windows.Rect $Win.Left, $Win.Top, $Win.Width, $Win.Height }
+        if ([double]::IsNaN($b.Width) -or $b.Width -le 0) { return $false }
+        $d = Get-PssConfigDir
+        if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force -ErrorAction Stop | Out-Null }
+        $json = [ordered]@{ Left = [math]::Round($b.Left, 1); Top = [math]::Round($b.Top, 1); Width = [math]::Round($b.Width, 1); Height = [math]::Round($b.Height, 1); Maximized = ($Win.WindowState -eq 'Maximized') } | ConvertTo-Json
+        [IO.File]::WriteAllText((Join-Path $d 'window.json'), $json, (New-Object Text.UTF8Encoding $false))
+        return $true
+    } catch { return $false }
+}
+
+function Restore-PssPlacement($Win, $Screens) {
+    # Puts the window back where it was last closed; ignored when that spot is on no screen now
+    $p = Read-PssPlacement
+    if (-not $p) { return $false }
+    if ($null -eq $Screens) { $Screens = Get-PssScreens }
+    if (-not (Test-PssPlacementVisible $p $Screens)) { return $false }
+    $Win.WindowStartupLocation = 'Manual'
+    $Win.Width = [Math]::Max($Win.MinWidth, $p.Width); $Win.Height = [Math]::Max($Win.MinHeight, $p.Height)
+    $Win.Left = $p.Left; $Win.Top = $p.Top
+    if ($p.Maximized) { $Win.WindowState = 'Maximized' }
+    return $true
+}
+
+function Save-PssWindowImage($Win, [string]$Path, [double]$Width = 0, [double]$Height = 0) {
+    # Lays a window's content out and saves it as a PNG without ever showing the window
+    $root = $Win.Content; $Win.Content = $null
+    foreach ($key in @($Win.Resources.Keys)) { $root.Resources[$key] = $Win.Resources[$key] }
+    $wrap = New-Object Windows.Controls.Border
+    $wrap.Background = $Win.Background
+    [Windows.Documents.TextElement]::SetForeground($wrap, $Win.Foreground)
+    [Windows.Documents.TextElement]::SetFontFamily($wrap, $Win.FontFamily)
+    [Windows.Documents.TextElement]::SetFontSize($wrap, $Win.FontSize)
+    $wrap.Child = $root
+    if ($Width -le 0) {
+        $wrap.Measure((New-Object Windows.Size ([double]::PositiveInfinity), ([double]::PositiveInfinity)))
+        $Width = [Math]::Ceiling($wrap.DesiredSize.Width); $Height = [Math]::Ceiling($wrap.DesiredSize.Height)
+    }
+    $size = New-Object Windows.Size $Width, $Height
+    $wrap.Measure($size); $wrap.Arrange((New-Object Windows.Rect $size)); $wrap.UpdateLayout()
+    $bmp = New-Object Windows.Media.Imaging.RenderTargetBitmap ([int]$Width), ([int]$Height), 96, 96, ([Windows.Media.PixelFormats]::Pbgra32)
+    $bmp.Render($wrap)
+    $enc = New-Object Windows.Media.Imaging.PngBitmapEncoder
+    $enc.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($bmp))
+    $fs = [IO.File]::Create($Path); try { $enc.Save($fs) } finally { $fs.Close() }
+    return $wrap
+}
+
+function Show-PssMessage($Owner, [string]$Text, [string]$Buttons = 'OK', [string]$Icon = 'None', [string]$Snapshot) {
+    # The app's own message box (same title bar as the main window) instead of the Windows one.
+    # Returns 'OK', 'Yes' or 'No'. Closing it counts as No (or OK when that is the only button).
+    $glyphs = @{ Error = @('M12,2 A10,10 0 1 1 11.99,2 Z M8,8 L16,16 M16,8 L8,16', '#FF7B7B'); Warning = @('M12,2 L22.5,21 L1.5,21 Z M12,9 L12,14.5 M12,17.5 L12,18', '#FBBF24'); Question = @('M12,2 A10,10 0 1 1 11.99,2 Z M9,9.5 C9,5.5 15,5.5 15,9.5 C15,12 12,12 12,14.5 M12,17.5 L12,18', '#38BDF8'); Information = @('M12,2 A10,10 0 1 1 11.99,2 Z M12,10.5 L12,17 M12,7 L12,7.5', '#38BDF8') }
+    $g = $glyphs[$Icon]
+    $iconXaml = if ($g) { '<Path DockPanel.Dock="Left" Width="24" Height="24" Margin="0,1,14,0" VerticalAlignment="Top" Stroke="' + $g[1] + '" StrokeThickness="2" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round" Data="' + $g[0] + '"/>' } else { '' }
+    $btnXaml = if ($Buttons -eq 'YesNo') { '<Button x:Name="BtnA" IsDefault="True" Tag="Yes">Yes</Button><Button x:Name="BtnB" IsCancel="True" Tag="No" Margin="0">No</Button>' } else { '<Button x:Name="BtnA" IsDefault="True" IsCancel="True" Tag="OK" Margin="0">OK</Button>' }
+    $xamlText = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="PAX Startup Scanner" SizeToContent="WidthAndHeight" MinWidth="380" ResizeMode="NoResize" WindowStyle="None" ShowInTaskbar="False"
+        Background="#0F1115" Foreground="#E6E8EE" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
+  <WindowChrome.WindowChrome>
+    <WindowChrome CaptionHeight="38" ResizeBorderThickness="0" GlassFrameThickness="0,0,0,1" CornerRadius="0" UseAeroCaptionButtons="False"/>
+  </WindowChrome.WindowChrome>
+  <Window.Resources>
+%STYLES%
+    <Style TargetType="Button">
+      <Setter Property="Foreground" Value="#E6E8EE"/><Setter Property="Background" Value="#222734"/><Setter Property="BorderBrush" Value="#30364A"/>
+      <Setter Property="Padding" Value="18,5"/><Setter Property="Margin" Value="0,0,8,0"/><Setter Property="MinWidth" Value="84"/><Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
+        <Border x:Name="b" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1" CornerRadius="5" Padding="{TemplateBinding Padding}">
+          <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
+        <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="Background" Value="#2E3547"/></Trigger>
+        <Trigger Property="IsDefault" Value="True"><Setter TargetName="b" Property="BorderBrush" Value="#2563EB"/></Trigger></ControlTemplate.Triggers>
+      </ControlTemplate></Setter.Value></Setter>
+    </Style>
+  </Window.Resources>
+  <Border x:Name="RootBorder" BorderBrush="#2A3040" BorderThickness="1">
+  <DockPanel>
+%TITLEBAR%
+  <Border DockPanel.Dock="Bottom" Background="#0A0D12" BorderBrush="#1B2030" BorderThickness="0,1,0,0" Padding="16,10">
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">%BUTTONS%</StackPanel>
+  </Border>
+  <DockPanel Margin="18,16,22,18">%ICON%<TextBlock x:Name="Msg" TextWrapping="Wrap" MaxWidth="520" LineHeight="19"/></DockPanel>
+  </DockPanel>
+  </Border>
+</Window>
+'@
+    $xamlText = $xamlText.Replace('%STYLES%', (Get-PssChromeXaml -Styles)).Replace('%TITLEBAR%', (Get-PssChromeXaml -NoMinimize)).Replace('%BUTTONS%', $btnXaml).Replace('%ICON%', $iconXaml)
+    [xml]$xaml = $xamlText
+    $dlg = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
+    Initialize-PssChrome $dlg
+    $dlg.FindName('Msg').Text = $Text
+    $result = @{ Value = $(if ($Buttons -eq 'YesNo') { 'No' } else { 'OK' }) }
+    foreach ($n in 'BtnA', 'BtnB') {
+        $b = $dlg.FindName($n)
+        if ($b) { $b.Add_Click({ param($s) $result.Value = [string]$s.Tag; ([Windows.Window]::GetWindow($s)).Close() }) }
+    }
+    if ($Snapshot) { [void](Save-PssWindowImage $dlg $Snapshot); return $result.Value }
+    if ($Owner -and $Owner.IsVisible) { $dlg.Owner = $Owner; $dlg.WindowStartupLocation = 'CenterOwner' } else { $dlg.WindowStartupLocation = 'CenterScreen' }
+    [void]$dlg.ShowDialog()
+    return $result.Value
+}
+
 function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
     # -Snapshot <png>: render the window off-screen to an image instead of showing it (self-test, README screenshots)
     if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
@@ -2635,13 +2861,13 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
     }
     try { Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction Stop } catch { Write-Host '   WPF is not available on this system.' -ForegroundColor Red; Start-Sleep 2; return $Scan }
 
-    [xml]$xaml = @'
+    $xamlText = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="PAX Startup Scanner" Width="1280" Height="800" MinWidth="900" MinHeight="560" WindowStartupLocation="CenterScreen"
         WindowStyle="None" ResizeMode="CanResize"
         Background="#0F1115" Foreground="#E6E8EE" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
   <WindowChrome.WindowChrome>
-    <WindowChrome CaptionHeight="38" ResizeBorderThickness="6" GlassFrameThickness="0" CornerRadius="0" UseAeroCaptionButtons="False"/>
+    <WindowChrome CaptionHeight="38" ResizeBorderThickness="6" GlassFrameThickness="0,0,0,1" CornerRadius="0" UseAeroCaptionButtons="False"/>
   </WindowChrome.WindowChrome>
   <Window.Resources>
     <SolidColorBrush x:Key="Card" Color="#171A21"/>
@@ -2746,37 +2972,12 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
         </Trigger>
       </Style.Triggers>
     </Style>
-    <Style x:Key="Caption" TargetType="Button">
-      <Setter Property="Width" Value="46"/><Setter Property="Height" Value="38"/><Setter Property="Foreground" Value="#C9CEDA"/>
-      <Setter Property="FontFamily" Value="Segoe MDL2 Assets"/><Setter Property="FontSize" Value="10"/>
-      <Setter Property="WindowChrome.IsHitTestVisibleInChrome" Value="True"/>
-      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
-        <Border x:Name="b" Background="Transparent"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
-        <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="Background" Value="#262B36"/></Trigger></ControlTemplate.Triggers>
-      </ControlTemplate></Setter.Value></Setter>
-    </Style>
-    <Style x:Key="CaptionClose" TargetType="Button" BasedOn="{StaticResource Caption}">
-      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
-        <Border x:Name="b" Background="Transparent"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
-        <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="Background" Value="#C42B1C"/><Setter Property="Foreground" Value="#FFFFFF"/></Trigger></ControlTemplate.Triggers>
-      </ControlTemplate></Setter.Value></Setter>
-    </Style>
+%STYLES%
   </Window.Resources>
   <Border x:Name="RootBorder" BorderBrush="#2A3040" BorderThickness="1">
   <DockPanel>
   <!-- the app's own title bar: drag to move, double-click to maximize, Windows snap still works -->
-  <Grid DockPanel.Dock="Top" Height="38" Background="#0A0C10">
-    <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="12,0,0,0">
-      <Image x:Name="TitleIcon" Width="18" Height="18" Margin="0,0,10,0"/>
-      <TextBlock Text="PAX Startup Scanner" FontWeight="SemiBold" Foreground="#E6E8EE" VerticalAlignment="Center"/>
-      <TextBlock x:Name="TitleVer" Foreground="#6B7385" Margin="8,0,0,0" VerticalAlignment="Center"/>
-    </StackPanel>
-    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-      <Button x:Name="CapMin" Style="{StaticResource Caption}" ToolTip="Minimize">&#xE921;</Button>
-      <Button x:Name="CapMax" Style="{StaticResource Caption}" ToolTip="Maximize">&#xE922;</Button>
-      <Button x:Name="CapClose" Style="{StaticResource CaptionClose}" ToolTip="Close">&#xE8BB;</Button>
-    </StackPanel>
-  </Grid>
+%TITLEBAR%
   <Grid Margin="16,10,16,8">
     <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
     <DockPanel Grid.Row="0">
@@ -2924,33 +3125,17 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
   </Border>
 </Window>
 '@
+    [xml]$xaml = $xamlText.Replace('%STYLES%', (Get-PssChromeXaml -Styles)).Replace('%TITLEBAR%', (Get-PssChromeXaml -Resizable))
     $win = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
-    # Own icon for the title bar, Alt+Tab and the taskbar (instead of PowerShell's)
+    # Own title bar (PAX App Standard): caption buttons, maximized padding, own icon for the title bar,
+    # Alt+Tab and the taskbar instead of PowerShell's
+    Initialize-PssChrome $win
     try {
-        $icon = New-PssIcon 256
-        $win.Icon = $icon
-        $win.FindName('TitleIcon').Source = $icon
+        $win.Icon = New-PssIcon 256
         # (compiling the small taskbar helper writes temp files, so read-only mode skips it)
         if (-not $Snapshot -and -not $script:PssReadOnly) { Set-PssAppId }
     } catch {}
-    # Own title bar: caption buttons, and keep the window on screen when maximized
     $win.FindName('TitleVer').Text = "v$($script:PssVersion)" + $(if ($script:PssReadOnly) { '  -  read-only' } else { '' })
-    $capMax = $win.FindName('CapMax'); $rootBorder = $win.FindName('RootBorder')
-    $win.FindName('CapMin').Add_Click({ $win.WindowState = 'Minimized' })
-    $capMax.Add_Click({ $win.WindowState = $(if ($win.WindowState -eq 'Maximized') { 'Normal' } else { 'Maximized' }) })
-    $win.FindName('CapClose').Add_Click({ $win.Close() })
-    $win.Add_StateChanged({
-            if ($win.WindowState -eq 'Maximized') {
-                # a borderless maximized window hangs over the screen edges by the resize border
-                $t = [Windows.SystemParameters]::WindowResizeBorderThickness
-                $rootBorder.Margin = New-Object Windows.Thickness ($t.Left + 2), ($t.Top + 2), ($t.Right + 2), ($t.Bottom + 2)
-                $rootBorder.BorderThickness = 0
-                $capMax.Content = [string][char]0xE923; $capMax.ToolTip = 'Restore down'
-            } else {
-                $rootBorder.Margin = 0; $rootBorder.BorderThickness = 1
-                $capMax.Content = [string][char]0xE922; $capMax.ToolTip = 'Maximize'
-            }
-        })
     $ui = @{}
     foreach ($n in 'SubTitle', 'Tiles', 'Search', 'SearchHint', 'HideMs', 'BtnClear', 'Facets', 'BootTestTab', 'BtLabel', 'BtnBtArm', 'BtnBtCancel', 'BtnBtRestart', 'BtState', 'BtnBtRefresh', 'BtGrid', 'BtnBtCompare', 'BtCompare', 'BtnExport', 'BtnBackup', 'BtnRescan', 'Banner', 'Grid', 'Detail', 'BtnLoc', 'BtnFile', 'BtnVt', 'BtnWeb', 'BtnCopy', 'BtnToggle', 'BtnDelete', 'BootGrid', 'DelayGrid', 'Tabs', 'UndoTab', 'UndoNote', 'UndoGrid', 'BtnUndoSel', 'BtnUndoFolder', 'BtnUndoRefresh', 'Status') { $ui[$n] = $win.FindName($n) }
     $state = @{ Scan = $Scan; Job = $null }
@@ -3065,14 +3250,14 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
             $r = Start-PssBootTest $ui.BtLabel.Text
             $ui.Status.Text = $r.Message
             & $loadBootTests
-            if (-not $r.Ok) { [void][Windows.MessageBox]::Show($win, $r.Message, 'PAX Startup Scanner', 'OK', 'Error'); return }
+            if (-not $r.Ok) { [void](Show-PssMessage $win $r.Message 'OK' 'Error'); return }
             $q = "$($r.Message)`n`nRestart now? Save your work first. Windows restarts 15 seconds after you choose Yes."
-            if ([string][Windows.MessageBox]::Show($win, $q, 'PAX Startup Scanner', 'YesNo', 'Question') -eq 'Yes') { $ui.Status.Text = (Restart-PssNow).Message }
+            if ([string](Show-PssMessage $win $q 'YesNo' 'Question') -eq 'Yes') { $ui.Status.Text = (Restart-PssNow).Message }
         })
     $ui.BtnBtCancel.Add_Click({ $ui.Status.Text = (Stop-PssBootTest).Message; & $loadBootTests })
     $ui.BtnBtRefresh.Add_Click({ & $loadBootTests })
     $ui.BtnBtRestart.Add_Click({
-            if ([string][Windows.MessageBox]::Show($win, 'Restart the PC now? Save your work first. Windows restarts 15 seconds after you choose Yes.', 'PAX Startup Scanner', 'YesNo', 'Warning') -eq 'Yes') { $ui.Status.Text = (Restart-PssNow).Message }
+            if ([string](Show-PssMessage $win 'Restart the PC now? Save your work first. Windows restarts 15 seconds after you choose Yes.' 'YesNo' 'Warning') -eq 'Yes') { $ui.Status.Text = (Restart-PssNow).Message }
         })
     $ui.BtnBtCompare.Add_Click({
             $all = @($ui.BtGrid.ItemsSource | Sort-Object Boot)
@@ -3181,7 +3366,7 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
             $note = ($ui.Status.Text -split '  -  ' | Select-Object -SkipLast 1) -join ' - '
         }
         try { Export-PssReport $out $d.FileName $note; $ui.Status.Text = "Saved $($d.FileName)"; if ($d.FileName -match '\.html$') { Start-Process $d.FileName } }
-        catch { [void][Windows.MessageBox]::Show($win, "Could not save: $($_.Exception.Message)", 'PAX Startup Scanner', 'OK', 'Error') }
+        catch { [void](Show-PssMessage $win "Could not save: $($_.Exception.Message)" 'OK' 'Error') }
     }
     $ui.BtnExport.Add_Click({
             $m = New-Object Windows.Controls.ContextMenu
@@ -3208,7 +3393,7 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
         $d.FileName = 'PAX-Startup-Backup-{0}-{1:yyyyMMdd-HHmm}' -f $env:COMPUTERNAME, (Get-Date)
         if (-not $d.ShowDialog($win)) { return }
         try { [IO.File]::WriteAllText($d.FileName, $json, (New-Object Text.UTF8Encoding $false)); $ui.Status.Text = "Saved a backup of $n startup entries to $($d.FileName)" }
-        catch { [void][Windows.MessageBox]::Show($win, "Could not save: $($_.Exception.Message)", 'PAX Startup Scanner', 'OK', 'Error') }
+        catch { [void](Show-PssMessage $win "Could not save: $($_.Exception.Message)" 'OK' 'Error') }
     }
     $restoreFrom = {
         param([bool]$Clipboard)
@@ -3220,14 +3405,14 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
                 if (-not $d.ShowDialog($win)) { return }
                 $snap = Read-PssSnapshot ([IO.File]::ReadAllText($d.FileName))
             }
-        } catch { [void][Windows.MessageBox]::Show($win, $_.Exception.Message, 'PAX Startup Scanner', 'OK', 'Error'); return }
+        } catch { [void](Show-PssMessage $win $_.Exception.Message 'OK' 'Error'); return }
         $icon = if ($snap.Computer -ne $env:COMPUTERNAME) { 'Warning' } else { 'Question' }
-        if ([string][Windows.MessageBox]::Show($win, (Confirm-PssRestoreText $snap), 'PAX Startup Scanner', 'YesNo', $icon) -ne 'Yes') { return }
+        if ([string](Show-PssMessage $win (Confirm-PssRestoreText $snap) 'YesNo' $icon) -ne 'Yes') { return }
         $win.Cursor = [Windows.Input.Cursors]::Wait
         try { $r = Restore-PssSnapshot $snap } finally { $win.Cursor = $null }
         $ui.Status.Text = $r.Message
-        if ($r.Failed) { [void][Windows.MessageBox]::Show($win, ($r.Message + "`n`n" + ($r.Failed -join "`n")), 'PAX Startup Scanner', 'OK', 'Warning') }
-        elseif (-not $r.Ok) { [void][Windows.MessageBox]::Show($win, $r.Message, 'PAX Startup Scanner', 'OK', 'Error') }
+        if ($r.Failed) { [void](Show-PssMessage $win ($r.Message + "`n`n" + ($r.Failed -join "`n")) 'OK' 'Warning') }
+        elseif (-not $r.Ok) { [void](Show-PssMessage $win $r.Message 'OK' 'Error') }
         if ($r.Message -notlike 'Read-only*' -and -not $state.Job) { & $startRescan }
     }
     $ui.BtnBackup.Add_Click({
@@ -3258,11 +3443,11 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
         $it = & $sel; if (-not $it) { return }
         # Disable/Enable are reversible and happen straight away; only Delete asks first
         if ($Action -eq 'Delete') {
-            $answer = [Windows.MessageBox]::Show($win, (Get-PssConfirmText $it $Action), 'PAX Startup Scanner', 'YesNo', 'Warning')
+            $answer = (Show-PssMessage $win (Get-PssConfirmText $it $Action) 'YesNo' 'Warning')
             if ([string]$answer -ne 'Yes') { return }
         }
         $res = Invoke-PssChange $it $Action
-        if (-not $res.Ok) { [void][Windows.MessageBox]::Show($win, $res.Message, 'PAX Startup Scanner', 'OK', 'Error') }
+        if (-not $res.Ok) { [void](Show-PssMessage $win $res.Message 'OK' 'Error') }
         & $applyFilter
         if ($ui.Grid.Items.Contains($it)) { $ui.Grid.SelectedItem = $it; $ui.Grid.ScrollIntoView($it) }
         $ui.Status.Text = $res.Message + $(if ($res.Ok -and $Action -ne 'Delete') { '  (Undo changes can reverse it.)' } else { '' })
@@ -3278,10 +3463,10 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
     $ui.BtnUndoSel.Add_Click({
             $r = $ui.UndoGrid.SelectedItem; if (-not $r) { return }
             $q = "Undo this change?`n`n$($r.Action): $($r.Name)`n$($r.Category): $($r.Location)`nMade $($r.When) by $($r.RunBy)"
-            if ([string][Windows.MessageBox]::Show($win, $q, 'PAX Startup Scanner', 'YesNo', 'Question') -ne 'Yes') { return }
+            if ([string](Show-PssMessage $win $q 'YesNo' 'Question') -ne 'Yes') { return }
             $res = Invoke-PssUndo $r
             $ui.Status.Text = $res.Message
-            if (-not $res.Ok) { [void][Windows.MessageBox]::Show($win, $res.Message, 'PAX Startup Scanner', 'OK', 'Error') }
+            if (-not $res.Ok) { [void](Show-PssMessage $win $res.Message 'OK' 'Error') }
             & $loadUndo
             if ($res.Ok -and -not $state.Job) { & $startRescan }
         })
@@ -3324,6 +3509,12 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
         $wa = [Windows.SystemParameters]::WorkArea
         $win.Width = [Math]::Max(1000, [Math]::Min(1500, $wa.Width * 0.92)); $win.Height = [Math]::Max(600, [Math]::Min(940, $wa.Height * 0.92))
     } catch {}
+    # Back where it was last time (size, position, maximized), unless that spot is on no screen now;
+    # saved to %APPDATA%\PaxStartupScanner\window.json on close (not in read-only mode)
+    if (-not $Snapshot) {
+        [void](Restore-PssPlacement $win)
+        $win.Add_Closing({ [void](Save-PssPlacement $win) })
+    }
     if ($Snapshot) {
         # Lay the window content out without ever showing a window, then save it as a PNG
         $root = $win.Content; $win.Content = $null
