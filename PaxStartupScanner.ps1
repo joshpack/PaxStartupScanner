@@ -36,7 +36,7 @@ param(
     [switch]$ReadOnly
 )
 
-$script:PssVersion = '1.3.1'
+$script:PssVersion = '1.4.0'
 $script:PssUrl     = 'https://raw.githubusercontent.com/joshpack/PaxStartupScanner/main/PaxStartupScanner.ps1'
 $script:PssSelfPath = $PSCommandPath   # empty when run through irm | iex
 
@@ -2635,7 +2635,11 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
     [xml]$xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="PAX Startup Scanner" Width="1280" Height="800" MinWidth="900" MinHeight="560" WindowStartupLocation="CenterScreen"
+        WindowStyle="None" ResizeMode="CanResize"
         Background="#0F1115" Foreground="#E6E8EE" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
+  <WindowChrome.WindowChrome>
+    <WindowChrome CaptionHeight="38" ResizeBorderThickness="6" GlassFrameThickness="0" CornerRadius="0" UseAeroCaptionButtons="False"/>
+  </WindowChrome.WindowChrome>
   <Window.Resources>
     <SolidColorBrush x:Key="Card" Color="#171A21"/>
     <SolidColorBrush x:Key="Line" Color="#262B36"/>
@@ -2739,16 +2743,42 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
         </Trigger>
       </Style.Triggers>
     </Style>
+    <Style x:Key="Caption" TargetType="Button">
+      <Setter Property="Width" Value="46"/><Setter Property="Height" Value="38"/><Setter Property="Foreground" Value="#C9CEDA"/>
+      <Setter Property="FontFamily" Value="Segoe MDL2 Assets"/><Setter Property="FontSize" Value="10"/>
+      <Setter Property="WindowChrome.IsHitTestVisibleInChrome" Value="True"/>
+      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
+        <Border x:Name="b" Background="Transparent"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
+        <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="Background" Value="#262B36"/></Trigger></ControlTemplate.Triggers>
+      </ControlTemplate></Setter.Value></Setter>
+    </Style>
+    <Style x:Key="CaptionClose" TargetType="Button" BasedOn="{StaticResource Caption}">
+      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
+        <Border x:Name="b" Background="Transparent"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
+        <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="Background" Value="#C42B1C"/><Setter Property="Foreground" Value="#FFFFFF"/></Trigger></ControlTemplate.Triggers>
+      </ControlTemplate></Setter.Value></Setter>
+    </Style>
   </Window.Resources>
-  <Grid Margin="16,12,16,8">
+  <Border x:Name="RootBorder" BorderBrush="#2A3040" BorderThickness="1">
+  <DockPanel>
+  <!-- the app's own title bar: drag to move, double-click to maximize, Windows snap still works -->
+  <Grid DockPanel.Dock="Top" Height="38" Background="#0A0C10">
+    <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="12,0,0,0">
+      <Image x:Name="TitleIcon" Width="18" Height="18" Margin="0,0,10,0"/>
+      <TextBlock Text="PAX Startup Scanner" FontWeight="SemiBold" Foreground="#E6E8EE" VerticalAlignment="Center"/>
+      <TextBlock x:Name="TitleVer" Foreground="#6B7385" Margin="8,0,0,0" VerticalAlignment="Center"/>
+    </StackPanel>
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+      <Button x:Name="CapMin" Style="{StaticResource Caption}" ToolTip="Minimize">&#xE921;</Button>
+      <Button x:Name="CapMax" Style="{StaticResource Caption}" ToolTip="Maximize">&#xE922;</Button>
+      <Button x:Name="CapClose" Style="{StaticResource CaptionClose}" ToolTip="Close">&#xE8BB;</Button>
+    </StackPanel>
+  </Grid>
+  <Grid Margin="16,10,16,8">
     <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
     <DockPanel Grid.Row="0">
-      <StackPanel DockPanel.Dock="Left" Orientation="Horizontal">
-        <Image x:Name="TitleIcon" Width="40" Height="40" Margin="0,0,12,0" VerticalAlignment="Center"/>
-        <StackPanel VerticalAlignment="Center">
-          <TextBlock FontSize="20" FontWeight="SemiBold">PAX Startup Scanner</TextBlock>
-          <TextBlock x:Name="SubTitle" Foreground="{StaticResource Mut}" Margin="0,2,0,0"/>
-        </StackPanel>
+      <StackPanel DockPanel.Dock="Left" VerticalAlignment="Center">
+        <TextBlock x:Name="SubTitle" Foreground="{StaticResource Mut}" FontSize="14"/>
       </StackPanel>
       <StackPanel x:Name="Tiles" Orientation="Horizontal" HorizontalAlignment="Right" DockPanel.Dock="Right"/>
     </DockPanel>
@@ -2887,6 +2917,8 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
     </TabControl>
     <TextBlock x:Name="Status" Grid.Row="4" Foreground="{StaticResource Mut}" Margin="2,6,0,0"/>
   </Grid>
+  </DockPanel>
+  </Border>
 </Window>
 '@
     $win = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
@@ -2898,6 +2930,24 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
         # (compiling the small taskbar helper writes temp files, so read-only mode skips it)
         if (-not $Snapshot -and -not $script:PssReadOnly) { Set-PssAppId }
     } catch {}
+    # Own title bar: caption buttons, and keep the window on screen when maximized
+    $win.FindName('TitleVer').Text = "v$($script:PssVersion)" + $(if ($script:PssReadOnly) { '  -  read-only' } else { '' })
+    $capMax = $win.FindName('CapMax'); $rootBorder = $win.FindName('RootBorder')
+    $win.FindName('CapMin').Add_Click({ $win.WindowState = 'Minimized' })
+    $capMax.Add_Click({ $win.WindowState = $(if ($win.WindowState -eq 'Maximized') { 'Normal' } else { 'Maximized' }) })
+    $win.FindName('CapClose').Add_Click({ $win.Close() })
+    $win.Add_StateChanged({
+            if ($win.WindowState -eq 'Maximized') {
+                # a borderless maximized window hangs over the screen edges by the resize border
+                $t = [Windows.SystemParameters]::WindowResizeBorderThickness
+                $rootBorder.Margin = New-Object Windows.Thickness ($t.Left + 2), ($t.Top + 2), ($t.Right + 2), ($t.Bottom + 2)
+                $rootBorder.BorderThickness = 0
+                $capMax.Content = [string][char]0xE923; $capMax.ToolTip = 'Restore down'
+            } else {
+                $rootBorder.Margin = 0; $rootBorder.BorderThickness = 1
+                $capMax.Content = [string][char]0xE922; $capMax.ToolTip = 'Maximize'
+            }
+        })
     $ui = @{}
     foreach ($n in 'SubTitle', 'Tiles', 'Search', 'SearchHint', 'HideMs', 'BtnClear', 'Facets', 'BootTestTab', 'BtLabel', 'BtnBtArm', 'BtnBtCancel', 'BtnBtRestart', 'BtState', 'BtnBtRefresh', 'BtGrid', 'BtnBtCompare', 'BtCompare', 'BtnExport', 'BtnBackup', 'BtnRescan', 'Banner', 'Grid', 'Detail', 'BtnLoc', 'BtnFile', 'BtnVt', 'BtnWeb', 'BtnCopy', 'BtnToggle', 'BtnDelete', 'BootGrid', 'DelayGrid', 'Tabs', 'UndoTab', 'UndoNote', 'UndoGrid', 'BtnUndoSel', 'BtnUndoFolder', 'BtnUndoRefresh', 'Status') { $ui[$n] = $win.FindName($n) }
     $state = @{ Scan = $Scan; Job = $null }
