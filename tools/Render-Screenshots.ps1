@@ -21,6 +21,18 @@ function New-Sample {
         [int]$Delay = 0, [bool]$Enabled = $true, $Kind = '', $Desc = '', [bool]$NoImage = $false, $Extra = '', [int]$AgeDays = 400, $ValueName = '')
     $p = @{ Category = $Category; Name = $Name; Location = $Location; Command = $Command; Enabled = $Enabled; User = $User; Trigger = $Trigger; Kind = $Kind; Extra = $Extra; ValueName = $ValueName }
     if ($NoImage) { $p.NoImage = $true } else { $p.Image = $Image }
+    # How the sample could be changed (drives the Disable/Delete buttons; nothing is ever changed here)
+    $p.Op = switch ($Category) {
+        'Run Key' { @{ Type = 'RegValue'; Key = $Location; Name = $Name; ApprovedRoot = 'HKU\S-1-5-21-0'; ApprovedKind = 'Run' } }
+        'Startup Folder' { @{ Type = 'File'; Path = $Location; ApprovedRoot = 'HKU\S-1-5-21-0'; ApprovedName = 'sample.lnk' } }
+        'Scheduled Task' { @{ Type = 'Task'; Path = $Name } }
+        'Service' { @{ Type = 'Service'; Name = 'sample'; Start = 'auto' } }
+        'Driver' { @{ Type = 'Service'; Name = 'sample'; Start = $(if ($Trigger -like 'Boot*') { 'boot' } else { 'system' }) } }
+        'WMI' { @{ Type = 'Wmi'; Class = 'CommandLineEventConsumer'; Name = $Name } }
+        'Winlogon' { @{ Type = 'ListPart'; Key = $Location; Name = 'Shell'; Part = $Command; Sep = ','; Default = '' } }
+        'Store App' { @{ Type = 'StoreApp'; Key = $Location; ByPolicy = $false } }
+        default { @{ Type = 'RegValue'; Key = $Location; Name = $Name } }
+    }
     Add-PssItem @p
     $it = $script:PssItems[$script:PssItems.Count - 1]
     if ($Image) { $it.ImagePath = $Image }
@@ -39,6 +51,16 @@ function New-Sample {
     if ($Delay) { $it.BootDelayMs = $Delay; $it.BootDelayCount = 3; $it.BootDelayText = '{0:N1}s' -f ($Delay / 1000) }
     $it.Impact = if ($Delay -ge 3000 -or $Mem -ge 400) { 'High' } elseif ($Delay -ge 1000 -or $Mem -ge 150) { 'Medium' } elseif ($Mem -or $Delay) { 'Low' } else { '' }
     Measure-PssRisk $it
+    Set-PssPermissions $it
+}
+# Sample undo history for the Undo tab screenshot (the real list reads %ProgramData%\PaxStartupScanner\Backups)
+function Get-PssUndoRecords {
+    @(
+        [pscustomobject]@{ When = $now.AddMinutes(-2).ToString('yyyy-MM-dd HH:mm'); Action = 'Delete'; Category = 'Scheduled Task'; Name = '\OneDrive Sync Task'; Location = 'Task Scheduler \OneDrive Sync Task'; RunBy = 'CONTOSO\it-admin'; Steps = @() }
+        [pscustomobject]@{ When = $now.AddMinutes(-4).ToString('yyyy-MM-dd HH:mm'); Action = 'Delete'; Category = 'WMI'; Name = 'PerfCounterUpdate'; Location = 'root\subscription CommandLineEventConsumer'; RunBy = 'CONTOSO\it-admin'; Steps = @() }
+        [pscustomobject]@{ When = $now.AddMinutes(-6).ToString('yyyy-MM-dd HH:mm'); Action = 'Disable'; Category = 'Run Key'; Name = 'Spotify'; Location = 'HKU\...\Run'; RunBy = 'CONTOSO\it-admin'; Steps = @() }
+        [pscustomobject]@{ When = $now.AddMinutes(-7).ToString('yyyy-MM-dd HH:mm'); Action = 'Disable'; Category = 'Service'; Name = 'Printer Helper Service (PrnHelper)'; Location = 'HKLM\SYSTEM\CurrentControlSet\Services\PrnHelper'; RunBy = 'CONTOSO\it-admin'; Steps = @() }
+    )
 }
 $hku = 'HKU\S-1-5-21-1004336348-1177238915-682003330-1104\Software\Microsoft\Windows\CurrentVersion\Run'
 $hklm = 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
@@ -149,6 +171,7 @@ Save-Console (Join-Path $OutDir 'console-details.png') $title
 # 4) boot performance
 Show-PssBoot $scan
 Save-Console (Join-Path $OutDir 'console-boot.png') $title
-# 5) GUI
+# 5) GUI, startup items tab and Undo tab
 [void](Show-PssGui $scan -Snapshot (Join-Path $OutDir 'gui.png'))
+[void](Show-PssGui $scan -Snapshot (Join-Path $OutDir 'gui-undo.png') -SnapshotTab 2)
 Get-ChildItem $OutDir -Filter *.png | ForEach-Object { '{0}  {1:N0} KB' -f $_.Name, ($_.Length / 1KB) }

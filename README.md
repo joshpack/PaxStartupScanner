@@ -1,6 +1,8 @@
 # PAX Startup Scanner
 
-Finds everything that starts with Windows: what each item is, where it lives, who signed it, whether it looks suspicious, and what is slowing the machine down. It is one PowerShell script with nothing to install. You can run it straight from GitHub on any machine you are fixing.
+Finds everything that starts with Windows: what each item is, where it lives, who signed it, whether it looks suspicious, and what is slowing the machine down. You can then disable or delete what shouldn't be there. Every change is backed up and can be undone.
+
+It is one PowerShell script with nothing to install, so you can run it straight from GitHub on any machine you are fixing.
 
 ![Console dashboard](docs/screenshots/console-dashboard.png)
 
@@ -12,7 +14,7 @@ Open **PowerShell as Administrator** and paste:
 irm https://raw.githubusercontent.com/joshpack/PaxStartupScanner/main/PaxStartupScanner.ps1 | iex
 ```
 
-That's it. The script runs in memory and leaves nothing behind on the machine.
+That's it. The script runs in memory and installs nothing. The only files it writes are the backups of changes you choose to make (see [Removing startup items](#removing-startup-items)) and any report you export.
 
 On older systems where PowerShell doesn't use TLS 1.2 by default (Server 2012 R2/2016, early Windows 10), use:
 
@@ -56,6 +58,7 @@ The dashboard shows the risk summary, where things start from, boot times and th
 | `G` | Open the GUI with the same results |
 | `M` | Include clean Microsoft items when browsing and searching |
 | `R` | Rescan |
+| `U` | Undo a change made earlier (lists every saved change on this PC) |
 | any number | Show that item's details |
 
 ![Flagged items](docs/screenshots/console-flagged.png)
@@ -68,6 +71,10 @@ The details view shows the item's command, the resolved file, its signature, pub
 - **V**: look the hash up on VirusTotal.
 - **S**: search the web for the file name.
 - **C**: copy the details to the clipboard.
+- **D**: disable the item at startup (or enable it again).
+- **X**: delete the startup entry.
+
+Both **D** and **X** ask you to confirm first. The details view also shows which changes the item allows.
 
 ![Item details](docs/screenshots/console-details.png)
 
@@ -75,9 +82,54 @@ The details view shows the item's command, the resolved file, its signature, pub
 
 ## The GUI
 
-Press `G` from the menu or run with `-Gui`. The GUI is a single lightweight window with search, a category filter, a "hide clean Microsoft items" switch, a details pane and a boot-performance tab. Rescans run in the background, so the window stays responsive.
+Press `G` from the menu or run with `-Gui`. The GUI is a single lightweight window. It has:
+- search, a category filter and a "hide clean Microsoft items" switch
+- a details pane with **Disable** and **Delete** buttons
+- a boot-performance tab
+- an **Undo changes** tab
+
+Hover over a greyed-out button to see why an item can't be changed. Rescans run in the background, so the window stays responsive.
 
 ![GUI](docs/screenshots/gui.png)
+
+![Undo changes](docs/screenshots/gui-undo.png)
+
+## Removing startup items
+
+There are two ways to stop something starting. Both ask you to confirm first.
+
+**Disable** is the gentle option and can be reversed. The item stays installed but no longer starts automatically. It uses the same switches Windows uses:
+
+| Item | How it's disabled |
+|---|---|
+| Run keys and startup folders | The same flag Task Manager's Startup tab sets |
+| Scheduled tasks | The task is disabled |
+| Services and third-party drivers | Start type set to Disabled (takes effect after a restart). The original start type is remembered |
+| Microsoft Store apps | The app's startup task is turned off, like in Settings |
+
+**Delete** removes the startup entry itself, but never the program. It's the right tool for malware persistence and for leftovers of uninstalled software. What gets removed:
+- **Registry values:** the value itself.
+- **Startup-folder files:** the file is moved into the backup folder.
+- **Scheduled tasks:** the task, after its full definition is saved.
+- **Registry keys:** the key, after a `.reg` export.
+- **WMI subscriptions:** the consumer, its binding and its filter.
+- **Shared values** (`Userinit`, `AppInit_DLLs`, `BootExecute`, LSA packages): only that item's part is removed. An emptied `Shell` or `Userinit` gets the Windows default back.
+
+**Backups and Undo.** Before anything is changed, a record of the old state is written to `C:\ProgramData\PaxStartupScanner\Backups`. If the change fails, the record is removed again. **Undo** (`U` in the console, the **Undo changes** tab in the GUI) lists every change made on that PC and puts it back. Restored records move to `Backups\Restored`. Two exceptions:
+- **WMI subscriptions** aren't recreated automatically. Their definition is saved for reference.
+- **Restoring a deleted scheduled task** needs the ScheduledTasks module, which ships with Windows 8 / Server 2012 and later.
+
+**What's protected.** These can't be changed from the scanner:
+- clean Microsoft services and drivers
+- boot-start drivers (Windows may not start without them)
+- tasks under `\Microsoft\Windows`
+- Windows' default Winlogon and BootExecute values
+- clean Microsoft LSA, Explorer, print-monitor, netsh and Active Setup entries
+- Group Policy scripts (Group Policy would just put them back)
+
+Anything flagged as suspicious can always be changed, even when it uses a Microsoft program. An example is PowerShell running an encoded command.
+
+Machine-wide items (HKLM, services, most tasks) need an elevated PowerShell. Without admin rights the scanner tells you "Access denied" and changes nothing.
 
 ## What it scans
 
@@ -147,7 +199,7 @@ Matching takes some care:
 
 ## Safety and privacy
 
-- **Read-only.** It never disables, deletes or changes startup items. The one write is the same one Autoruns makes: **O** on a registry item sets Regedit's "last key" so Regedit opens at that key.
+- **Changes only what you confirm.** Scanning never changes anything. Startup items are only changed when you choose Disable or Delete and confirm. Every change is backed up first and can be undone. The only other write is the same one Autoruns makes: **O** on a registry item sets Regedit's "last key" so Regedit opens at that key.
 - **Nothing leaves the machine.** No telemetry and no uploads. **V** opens a VirusTotal page for the file's SHA-256 hash in the browser. The file itself is never uploaded. **S** opens a web search for the file name. Both happen only when you press the key.
 - **Exports are saved only where you choose.**
 

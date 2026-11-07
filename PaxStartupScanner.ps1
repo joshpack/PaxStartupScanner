@@ -5,7 +5,9 @@
     it lives, flags suspicious entries and shows what is slowing boot down.
 
 .DESCRIPTION
-    Read-only IT diagnostic tool. Nothing is installed and nothing on the system is changed.
+    IT diagnostic tool. Nothing is installed. It only changes the system when you choose
+    Disable or Delete on an item; every change is backed up to
+    %ProgramData%\PaxStartupScanner\Backups first and can be undone from the Undo list.
     Run it from an elevated PowerShell prompt straight from GitHub:
 
         irm https://raw.githubusercontent.com/joshpack/PaxStartupScanner/main/PaxStartupScanner.ps1 | iex
@@ -30,7 +32,7 @@ param(
     [string]$Export
 )
 
-$script:PssVersion = '1.0.0'
+$script:PssVersion = '1.1.0'
 $script:PssUrl     = 'https://raw.githubusercontent.com/joshpack/PaxStartupScanner/main/PaxStartupScanner.ps1'
 $script:PssSelfPath = $PSCommandPath   # empty when run through irm | iex
 
@@ -38,9 +40,13 @@ $script:PssSelfPath = $PSCommandPath   # empty when run through irm | iex
 #  Scanner engine
 # ======================================================================================
 
+function Initialize-PssRegistry {
+    if (-not $script:PssHKLM) { $script:PssHKLM = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64) }
+    if (-not $script:PssHKU) { $script:PssHKU = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::Users, [Microsoft.Win32.RegistryView]::Registry64) }
+}
+
 function Initialize-Pss {
-    $script:PssHKLM = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
-    $script:PssHKU  = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::Users, [Microsoft.Win32.RegistryView]::Registry64)
+    Initialize-PssRegistry
     $script:PssFileCache = @{}
     $win = $env:SystemRoot
     $dirs = New-Object System.Collections.Generic.List[string]
@@ -186,7 +192,9 @@ function Add-PssItem {
         [string]$Category, [string]$Name, [string]$Location, [string]$Command,
         [string]$Image, [bool]$Enabled = $true, [string]$User = '', [string]$Trigger = '',
         [string]$RegKey = '', [string]$ValueName = '', [string]$Extra = '', [string]$ServiceName = '',
-        [string]$Publisher = '', [string]$Kind = '', [bool]$NoImage = $false
+        [string]$Publisher = '', [string]$Kind = '', [bool]$NoImage = $false,
+        # How Disable/Delete work for this entry (see Invoke-PssChange)
+        [hashtable]$Op = $null
     )
     $res = $null
     # An explicit but empty -Image (e.g. a CLSID with no registered DLL) means there is no file to check
@@ -213,6 +221,7 @@ function Add-PssItem {
         Running = $false; ProcCount = 0; MemoryMB = 0; CpuSec = 0; RunText = ''
         BootDelayMs = 0; BootDelayCount = 0; BootDelayText = ''; BootDelayLast = $null; Impact = ''
         Flags = ''; FlagList = @(); Sha256 = ''
+        Op = $Op; State = ''; CanDisable = $false; CanDelete = $false; ActionNote = ''
     }
     $script:PssItems.Add($it)
 }
@@ -297,7 +306,10 @@ function Get-PssRunKeys {
                 if (-not $v) { continue }
                 $en = $true; if ($d.Appr) { $en = Get-PssApproved $r.Root $d.Appr $n }
                 $nm = if ($n) { $n } else { '(Default)' }
-                Add-PssItem -Category $d.Cat -Name $nm -Location $path -Command $v -Enabled $en -User $r.User -Trigger 'Logon' -RegKey $path -ValueName $n
+                # Disable uses Task Manager's StartupApproved flag (Run32 only exists for HKLM)
+                $appr = $d.Appr; if ($appr -eq 'Run32' -and $r.Root -ne 'HKLM') { $appr = '' }
+                $op = @{ Type = 'RegValue'; Key = $path; Name = $n; ApprovedRoot = $(if ($appr) { $r.Root } else { '' }); ApprovedKind = $appr }
+                Add-PssItem -Category $d.Cat -Name $nm -Location $path -Command $v -Enabled $en -User $r.User -Trigger 'Logon' -RegKey $path -ValueName $n -Op $op
             }
             $k.Close()
         }
@@ -308,7 +320,7 @@ function Get-PssRunKeys {
             if ($k) {
                 foreach ($n in 'Load', 'Run') {
                     $v = [string](Get-PssRegValue $k $n)
-                    if ($v) { Add-PssItem -Category 'Run Key' -Name "Windows\$n" -Location $path -Command $v -User $r.User -Trigger 'Logon' -RegKey $path -ValueName $n -Extra 'Legacy load point (rarely used legitimately)' }
+                    if ($v) { Add-PssItem -Category 'Run Key' -Name "Windows\$n" -Location $path -Command $v -User $r.User -Trigger 'Logon' -RegKey $path -ValueName $n -Extra 'Legacy load point (rarely used legitimately)' -Op @{ Type = 'RegValue'; Key = $path; Name = $n } }
                 }
                 $k.Close()
             }
@@ -345,7 +357,8 @@ function Get-PssStartupFolders {
             }
             $en = $true; if ($fd.Root) { $en = Get-PssApproved $fd.Root 'StartupFolder' $file.Name }
             $res = Resolve-PssImage $cmd
-            Add-PssItem -Category 'Startup Folder' -Name $file.BaseName -Location $file.FullName -Command $cmd -Image $res.Image -Enabled $en -User $fd.User -Trigger 'Logon' -Kind 'File' -Extra $extra
+            $op = @{ Type = 'File'; Path = $file.FullName; ApprovedRoot = $fd.Root; ApprovedName = $file.Name }
+            Add-PssItem -Category 'Startup Folder' -Name $file.BaseName -Location $file.FullName -Command $cmd -Image $res.Image -Enabled $en -User $fd.User -Trigger 'Logon' -Kind 'File' -Extra $extra -Op $op
         }
     }
 }
@@ -395,10 +408,10 @@ function Get-PssTasks {
                         $cmd = $a.C.Trim()
                         $full = if ($cmd.StartsWith('"')) { "$cmd $($a.A)" } else { "`"$cmd`" $($a.A)" }
                         $res = Resolve-PssImage $full
-                        Add-PssItem -Category 'Scheduled Task' -Name $t.Path -Location "Task Scheduler $($t.Path)" -Command ("$cmd $($a.A)").Trim() -Image $res.Image -Enabled ([bool]$t.Enabled) -User $runAs -Trigger $trigText -Extra ($extra -join '; ') -Kind 'Task'
+                        Add-PssItem -Category 'Scheduled Task' -Name $t.Path -Location "Task Scheduler $($t.Path)" -Command ("$cmd $($a.A)").Trim() -Image $res.Image -Enabled ([bool]$t.Enabled) -User $runAs -Trigger $trigText -Extra ($extra -join '; ') -Kind 'Task' -Op @{ Type = 'Task'; Path = $t.Path }
                     } else {
                         $c = Get-PssClsid $a.C
-                        Add-PssItem -Category 'Scheduled Task' -Name $t.Path -Location "Task Scheduler $($t.Path)" -Command "COM handler $($a.C) $($c.Name)" -Image $c.Dll -NoImage (-not $c.Dll) -Enabled ([bool]$t.Enabled) -User $runAs -Trigger $trigText -Extra ($extra -join '; ') -Kind 'Task'
+                        Add-PssItem -Category 'Scheduled Task' -Name $t.Path -Location "Task Scheduler $($t.Path)" -Command "COM handler $($a.C) $($c.Name)" -Image $c.Dll -NoImage (-not $c.Dll) -Enabled ([bool]$t.Enabled) -User $runAs -Trigger $trigText -Extra ($extra -join '; ') -Kind 'Task' -Op @{ Type = 'Task'; Path = $t.Path }
                     }
                 }
             } catch {}
@@ -444,7 +457,10 @@ function Get-PssServices {
         $res = Resolve-PssImage $img
         $image = $res.Image
         if ($dll) { $image = $dll; $extra += "; Host: $img" }
-        Add-PssItem -Category $(if ($isDriver) { 'Driver' } else { 'Service' }) -Name ("{0} ({1})" -f $s.DisplayName, $s.ServiceName) -Location $path -Command $img -Image $image -User $acct -Trigger $trig -RegKey $path -Extra $extra -ServiceName $s.ServiceName -Kind 'Service'
+        # sc.exe start type to put back when the item is enabled again
+        $orig = switch ($st) { 'Boot' { 'boot' } 'System' { 'system' } default { if ($delayed) { 'delayed-auto' } else { 'auto' } } }
+        $op = @{ Type = 'Service'; Name = $s.ServiceName; Start = $orig; IsDriver = $isDriver }
+        Add-PssItem -Category $(if ($isDriver) { 'Driver' } else { 'Service' }) -Name ("{0} ({1})" -f $s.DisplayName, $s.ServiceName) -Location $path -Command $img -Image $image -User $acct -Trigger $trig -RegKey $path -Extra $extra -ServiceName $s.ServiceName -Kind 'Service' -Op $op
         $script:PssItems[$script:PssItems.Count - 1].Running = ($status -eq 'Running')
     }
 }
@@ -461,14 +477,19 @@ function Get-PssWinlogon {
             foreach ($part in ($v -split ',')) {
                 $part = $part.Trim(); if (-not $part) { continue }
                 $default = ($n -eq 'Shell' -and $part -match '^(?i)explorer(\.exe)?$') -or ($n -eq 'Userinit' -and $part -match '^(?i)(C:\\Windows\\system32\\)?userinit(\.exe)?$') -or ($n -eq 'VmApplet' -and $part -match '(?i)SystemPropertiesPerformance')
-                Add-PssItem -Category 'Winlogon' -Name "Winlogon\$n" -Location $path -Command $part -User $r.User -Trigger 'Logon' -RegKey $path -ValueName $n -Extra $(if ($default) { 'Windows default value' } else { 'NON-DEFAULT value' }) -Kind $(if ($default) { 'Default' } else { 'Modified' })
+                # Removing a non-default part rewrites the value; an emptied machine Shell/Userinit gets the Windows default back
+                $dflt = ''
+                if ($r.Root -eq 'HKLM' -and $n -eq 'Shell') { $dflt = 'explorer.exe' }
+                if ($r.Root -eq 'HKLM' -and $n -eq 'Userinit') { $dflt = 'C:\Windows\system32\userinit.exe,' }
+                $op = @{ Type = 'ListPart'; Key = $path; Name = $n; Part = $part; Sep = ','; Default = $dflt }
+                Add-PssItem -Category 'Winlogon' -Name "Winlogon\$n" -Location $path -Command $part -User $r.User -Trigger 'Logon' -RegKey $path -ValueName $n -Extra $(if ($default) { 'Windows default value' } else { 'NON-DEFAULT value' }) -Kind $(if ($default) { 'Default' } else { 'Modified' }) -Op $op
             }
         }
         $nk = (Open-PssSub $k 'Notify')
         if ($nk) {
             foreach ($sn in $nk.GetSubKeyNames()) {
                 $sk = (Open-PssSub $nk $sn); $dll = [string](Get-PssRegValue $sk 'DllName'); $sk.Close()
-                if ($dll) { Add-PssItem -Category 'Winlogon' -Name "Notify\$sn" -Location "$path\Notify\$sn" -Command $dll -Image $dll -User $r.User -Trigger 'Logon' -RegKey "$path\Notify\$sn" -Kind 'Modified' }
+                if ($dll) { Add-PssItem -Category 'Winlogon' -Name "Notify\$sn" -Location "$path\Notify\$sn" -Command $dll -Image $dll -User $r.User -Trigger 'Logon' -RegKey "$path\Notify\$sn" -Kind 'Modified' -Op @{ Type = 'RegKey'; Key = "$path\Notify\$sn" } }
             }
             $nk.Close()
         }
@@ -483,7 +504,7 @@ function Get-PssMisc {
         $v = [string](Get-PssRegValue $k 'AppInit_DLLs'); $load = $k.GetValue('LoadAppInit_DLLs')
         if ($v) {
             foreach ($d in ($v -split '[,\s]+' | Where-Object { $_ })) {
-                Add-PssItem -Category 'AppInit' -Name ([IO.Path]::GetFileName($d)) -Location $p -Command $d -Image $d -Enabled ($load -eq 1) -Trigger 'Every GUI process' -RegKey $p -ValueName 'AppInit_DLLs' -Kind 'Modified'
+                Add-PssItem -Category 'AppInit' -Name ([IO.Path]::GetFileName($d)) -Location $p -Command $d -Image $d -Enabled ($load -eq 1) -Trigger 'Every GUI process' -RegKey $p -ValueName 'AppInit_DLLs' -Kind 'Modified' -Op @{ Type = 'ListPart'; Key = $p; Name = 'AppInit_DLLs'; Part = $d; Sep = ' '; Default = '' }
             }
         }
         $k.Close()
@@ -494,7 +515,7 @@ function Get-PssMisc {
         foreach ($sn in $k.GetSubKeyNames()) {
             $sk = (Open-PssSub $k $sn); if (-not $sk) { continue }
             $dbg = [string](Get-PssRegValue $sk 'Debugger')
-            if ($dbg) { Add-PssItem -Category 'IFEO' -Name "$sn -> Debugger" -Location "$base\$sn" -Command $dbg -Trigger "When $sn starts" -RegKey "$base\$sn" -ValueName 'Debugger' -Extra 'Runs instead of the target program' -Kind 'Modified' }
+            if ($dbg) { Add-PssItem -Category 'IFEO' -Name "$sn -> Debugger" -Location "$base\$sn" -Command $dbg -Trigger "When $sn starts" -RegKey "$base\$sn" -ValueName 'Debugger' -Extra 'Runs instead of the target program' -Kind 'Modified' -Op @{ Type = 'RegValue'; Key = "$base\$sn"; Name = 'Debugger' } }
             $sk.Close()
         }
         $k.Close()
@@ -504,7 +525,7 @@ function Get-PssMisc {
     if ($k) {
         foreach ($sn in $k.GetSubKeyNames()) {
             $sk = (Open-PssSub $k $sn); $m = [string](Get-PssRegValue $sk 'MonitorProcess'); $sk.Close()
-            if ($m) { Add-PssItem -Category 'IFEO' -Name "$sn -> MonitorProcess" -Location "$spe\$sn" -Command $m -Trigger "When $sn exits" -RegKey "$spe\$sn" -ValueName 'MonitorProcess' -Kind 'Modified' }
+            if ($m) { Add-PssItem -Category 'IFEO' -Name "$sn -> MonitorProcess" -Location "$spe\$sn" -Command $m -Trigger "When $sn exits" -RegKey "$spe\$sn" -ValueName 'MonitorProcess' -Kind 'Modified' -Op @{ Type = 'RegValue'; Key = "$spe\$sn"; Name = 'MonitorProcess' } }
         }
         $k.Close()
     }
@@ -518,7 +539,7 @@ function Get-PssMisc {
                 $def = ($v -match '^(?i)autocheck autochk \*$')
                 $first = ($v -split ' ')[0]
                 $img = $first; if ($first -eq 'autocheck') { $img = ($v -split ' ')[1] }
-                Add-PssItem -Category 'Boot Execute' -Name "$n" -Location $sm -Command $v -Image "$env:SystemRoot\System32\$img.exe" -Trigger 'Before Windows starts' -RegKey $sm -ValueName $n -Extra $(if ($def) { 'Windows default value' } else { 'NON-DEFAULT value' }) -Kind $(if ($def) { 'Default' } else { 'Modified' })
+                Add-PssItem -Category 'Boot Execute' -Name "$n" -Location $sm -Command $v -Image "$env:SystemRoot\System32\$img.exe" -Trigger 'Before Windows starts' -RegKey $sm -ValueName $n -Extra $(if ($def) { 'Windows default value' } else { 'NON-DEFAULT value' }) -Kind $(if ($def) { 'Default' } else { 'Modified' }) -Op @{ Type = 'ListPart'; Key = $sm; Name = $n; Part = $v; Sep = 'multi'; Default = '' }
             }
         }
         $k.Close()
@@ -530,7 +551,7 @@ function Get-PssMisc {
             foreach ($v in @($k.GetValue($n))) {
                 foreach ($pkg in ($v -split '\s+' | Where-Object { $_ -and $_ -ne '""' })) {
                     $dll = if ($pkg -match '\.dll$') { $pkg } else { "$pkg.dll" }
-                    Add-PssItem -Category 'LSA' -Name "$n\$pkg" -Location $p -Command $pkg -Image "$env:SystemRoot\System32\$dll" -Trigger 'Loaded by LSASS at boot' -RegKey $p -ValueName $n
+                    Add-PssItem -Category 'LSA' -Name "$n\$pkg" -Location $p -Command $pkg -Image "$env:SystemRoot\System32\$dll" -Trigger 'Loaded by LSASS at boot' -RegKey $p -ValueName $n -Op @{ Type = 'ListPart'; Key = $p; Name = $n; Part = $pkg; Sep = 'multi'; Default = '' }
                 }
             }
         }
@@ -542,7 +563,7 @@ function Get-PssMisc {
     if ($k) {
         foreach ($sn in $k.GetSubKeyNames()) {
             $sk = (Open-PssSub $k $sn); $d = [string](Get-PssRegValue $sk 'Driver'); $sk.Close()
-            if ($d) { Add-PssItem -Category 'Print Monitor' -Name $sn -Location "$pm\$sn" -Command $d -Image "$env:SystemRoot\System32\$d" -Trigger 'Loaded by spooler' -RegKey "$pm\$sn" -ValueName 'Driver' }
+            if ($d) { Add-PssItem -Category 'Print Monitor' -Name $sn -Location "$pm\$sn" -Command $d -Image "$env:SystemRoot\System32\$d" -Trigger 'Loaded by spooler' -RegKey "$pm\$sn" -ValueName 'Driver' -Op @{ Type = 'RegKey'; Key = "$pm\$sn" } }
         }
         $k.Close()
     }
@@ -556,7 +577,7 @@ function Get-PssMisc {
             if ($stub) {
                 # Some Windows components store a bare argument here (e.g. "U"); there is no program to check
                 $noPath = $stub -notmatch '\\|\.(exe|dll|cmd|bat|vbs|js|ps1)\b' -and -not (Resolve-PssImage $stub).Found
-                Add-PssItem -Category 'Active Setup' -Name $(if ($nm) { $nm } else { $sn }) -Location "$p\$sn" -Command $stub -Enabled ($isOn -ne 0) -Trigger 'First logon per user' -RegKey "$p\$sn" -ValueName 'StubPath' -NoImage $noPath -Extra $(if ($noPath) { 'StubPath holds no program path' } else { '' })
+                Add-PssItem -Category 'Active Setup' -Name $(if ($nm) { $nm } else { $sn }) -Location "$p\$sn" -Command $stub -Enabled ($isOn -ne 0) -Trigger 'First logon per user' -RegKey "$p\$sn" -ValueName 'StubPath' -NoImage $noPath -Extra $(if ($noPath) { 'StubPath holds no program path' } else { '' }) -Op @{ Type = 'RegValue'; Key = "$p\$sn"; Name = 'StubPath' }
             }
         }
         $k.Close()
@@ -566,7 +587,7 @@ function Get-PssMisc {
         $k = Open-PssKey $p; if (-not $k) { continue }
         foreach ($sn in $k.GetSubKeyNames()) {
             $c = Get-PssClsid $sn
-            Add-PssItem -Category 'Explorer' -Name $(if ($c.Name) { $c.Name } else { $sn }) -Location "$p\$sn" -Command "$sn" -Image $c.Dll -Trigger $(if ($p -match 'Browser') { 'Internet Explorer / Edge IE mode' } else { 'Explorer start' }) -RegKey "$p\$sn"
+            Add-PssItem -Category 'Explorer' -Name $(if ($c.Name) { $c.Name } else { $sn }) -Location "$p\$sn" -Command "$sn" -Image $c.Dll -Trigger $(if ($p -match 'Browser') { 'Internet Explorer / Edge IE mode' } else { 'Explorer start' }) -RegKey "$p\$sn" -Op @{ Type = 'RegKey'; Key = "$p\$sn" }
         }
         $k.Close()
     }
@@ -575,7 +596,7 @@ function Get-PssMisc {
         foreach ($n in $k.GetValueNames()) {
             $v = [string]$k.GetValue($n); $clsid = if ($p -match 'Shared') { $n } else { $v }
             $c = Get-PssClsid $clsid
-            Add-PssItem -Category 'Explorer' -Name $(if ($c.Name) { $c.Name } elseif ($n) { $n } else { $clsid }) -Location $p -Command $clsid -Image $c.Dll -Trigger 'Explorer start' -RegKey $p -ValueName $n
+            Add-PssItem -Category 'Explorer' -Name $(if ($c.Name) { $c.Name } elseif ($n) { $n } else { $clsid }) -Location $p -Command $clsid -Image $c.Dll -Trigger 'Explorer start' -RegKey $p -ValueName $n -Op @{ Type = 'RegValue'; Key = $p; Name = $n }
         }
         $k.Close()
     }
@@ -584,16 +605,16 @@ function Get-PssMisc {
     foreach ($r in $roots) {
         $p = "$($r.Root)\Software\Microsoft\Command Processor"
         $k = Open-PssKey $p
-        if ($k) { $v = [string](Get-PssRegValue $k 'AutoRun'); $k.Close(); if ($v) { Add-PssItem -Category 'Cmd AutoRun' -Name 'Command Processor AutoRun' -Location $p -Command $v -User $r.User -Trigger 'Every cmd.exe start' -RegKey $p -ValueName 'AutoRun' -Kind 'Modified' } }
+        if ($k) { $v = [string](Get-PssRegValue $k 'AutoRun'); $k.Close(); if ($v) { Add-PssItem -Category 'Cmd AutoRun' -Name 'Command Processor AutoRun' -Location $p -Command $v -User $r.User -Trigger 'Every cmd.exe start' -RegKey $p -ValueName 'AutoRun' -Kind 'Modified' -Op @{ Type = 'RegValue'; Key = $p; Name = 'AutoRun' } } }
         if ($r.Root -ne 'HKLM') {
             $p = "$($r.Root)\Environment"
             $k = Open-PssKey $p
-            if ($k) { $v = [string](Get-PssRegValue $k 'UserInitMprLogonScript'); $k.Close(); if ($v) { Add-PssItem -Category 'Logon Script' -Name 'UserInitMprLogonScript' -Location $p -Command $v -User $r.User -Trigger 'Logon' -RegKey $p -ValueName 'UserInitMprLogonScript' -Kind 'Modified' } }
+            if ($k) { $v = [string](Get-PssRegValue $k 'UserInitMprLogonScript'); $k.Close(); if ($v) { Add-PssItem -Category 'Logon Script' -Name 'UserInitMprLogonScript' -Location $p -Command $v -User $r.User -Trigger 'Logon' -RegKey $p -ValueName 'UserInitMprLogonScript' -Kind 'Modified' -Op @{ Type = 'RegValue'; Key = $p; Name = 'UserInitMprLogonScript' } } }
             $p = "$($r.Root)\Control Panel\Desktop"
             $k = Open-PssKey $p
             if ($k) {
                 $v = [string](Get-PssRegValue $k 'SCRNSAVE.EXE'); $act = [string]$k.GetValue('ScreenSaveActive'); $k.Close()
-                if ($v) { Add-PssItem -Category 'Screensaver' -Name ([IO.Path]::GetFileName($v)) -Location $p -Command $v -Image $v -Enabled ($act -eq '1') -User $r.User -Trigger 'Idle' -RegKey $p -ValueName 'SCRNSAVE.EXE' }
+                if ($v) { Add-PssItem -Category 'Screensaver' -Name ([IO.Path]::GetFileName($v)) -Location $p -Command $v -Image $v -Enabled ($act -eq '1') -User $r.User -Trigger 'Idle' -RegKey $p -ValueName 'SCRNSAVE.EXE' -Op @{ Type = 'RegValue'; Key = $p; Name = 'SCRNSAVE.EXE' } }
             }
             $p = "HKU\$($r.Sid)_Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData"
             $k = Open-PssKey $p
@@ -605,7 +626,7 @@ function Get-PssMisc {
                         $state = $tk.GetValue('State'); $tk.Close()
                         if ($null -eq $state) { continue }
                         $fam = ($pkg -split '_')[0]
-                        Add-PssItem -Category 'Store App' -Name "$fam ($tid)" -Location "$p\$pkg\$tid" -Command $pkg -Enabled ($state -in 2, 4, 5) -User $r.User -Trigger 'Logon' -RegKey "$p\$pkg\$tid" -ValueName 'State' -Publisher $(if ($fam -match '^Microsoft') { 'Microsoft (Store package)' } else { 'Store package' }) -NoImage $true -Extra "Package: $pkg; State: $state"
+                        Add-PssItem -Category 'Store App' -Name "$fam ($tid)" -Location "$p\$pkg\$tid" -Command $pkg -Enabled ($state -in 2, 4, 5) -User $r.User -Trigger 'Logon' -RegKey "$p\$pkg\$tid" -ValueName 'State' -Publisher $(if ($fam -match '^Microsoft') { 'Microsoft (Store package)' } else { 'Store package' }) -NoImage $true -Extra "Package: $pkg; State: $state" -Op @{ Type = 'StoreApp'; Key = "$p\$pkg\$tid"; ByPolicy = ($state -in 3, 4) }
                         $last = $script:PssItems[$script:PssItems.Count - 1]
                         $last.IsMicrosoft = ($fam -match '^(Microsoft|Windows)\.')
                     }
@@ -623,7 +644,7 @@ function Get-PssMisc {
                 $gk = (Open-PssSub $k $g); if (-not $gk) { continue }
                 foreach ($s in $gk.GetSubKeyNames()) {
                     $sk = (Open-PssSub $gk $s); $scr = [string]$sk.GetValue('Script'); $par = [string]$sk.GetValue('Parameters'); $sk.Close()
-                    if ($scr) { Add-PssItem -Category 'Logon Script' -Name "GPO $kind script" -Location "$p\$g\$s" -Command "$scr $par".Trim() -Image $scr -User $r.User -Trigger $kind -RegKey "$p\$g\$s" -ValueName 'Script' }
+                    if ($scr) { Add-PssItem -Category 'Logon Script' -Name "GPO $kind script" -Location "$p\$g\$s" -Command "$scr $par".Trim() -Image $scr -User $r.User -Trigger $kind -RegKey "$p\$g\$s" -ValueName 'Script' -Op @{ Type = 'Blocked'; Note = 'Set by Group Policy, which would put it back. Remove it from the Group Policy Object instead.' } }
                 }
                 $gk.Close()
             }
@@ -634,7 +655,7 @@ function Get-PssMisc {
     $p = 'HKLM\SOFTWARE\Microsoft\NetSh'
     $k = Open-PssKey $p
     if ($k) {
-        foreach ($n in $k.GetValueNames()) { $v = [string]$k.GetValue($n); if ($v) { Add-PssItem -Category 'Netsh' -Name $n -Location $p -Command $v -Image "$env:SystemRoot\System32\$v" -Trigger 'When netsh runs' -RegKey $p -ValueName $n } }
+        foreach ($n in $k.GetValueNames()) { $v = [string]$k.GetValue($n); if ($v) { Add-PssItem -Category 'Netsh' -Name $n -Location $p -Command $v -Image "$env:SystemRoot\System32\$v" -Trigger 'When netsh runs' -RegKey $p -ValueName $n -Op @{ Type = 'RegValue'; Key = $p; Name = $n } } }
         $k.Close()
     }
 }
@@ -660,7 +681,7 @@ function Get-PssWmi {
                 if ($f) { $q = $f.Query }
             }
         }
-        $wa = @{ Category = 'WMI'; Name = $c.Name; Location = "root\subscription $cls"; Command = $cmd; Trigger = $(if ($q) { $q } else { 'Not bound to a filter' }); Kind = 'Modified'; Extra = "Consumer type: $cls" }
+        $wa = @{ Category = 'WMI'; Name = $c.Name; Location = "root\subscription $cls"; Command = $cmd; Trigger = $(if ($q) { $q } else { 'Not bound to a filter' }); Kind = 'Modified'; Extra = "Consumer type: $cls"; Op = @{ Type = 'Wmi'; Class = $cls; Name = $c.Name } }
         if ($img) { $wa.Image = $img } elseif (-not $cmd -or $cls -eq 'ActiveScriptEventConsumer') { $wa.NoImage = $true }
         Add-PssItem @wa
     }
@@ -904,6 +925,7 @@ function Invoke-PssScan {
         if ($it.BootDelayMs) { $it.BootDelayText = '{0:N1}s' -f ($it.BootDelayMs / 1000) }
         $it.Impact = if ($it.BootDelayMs -ge 3000 -or $it.MemoryMB -ge 400) { 'High' } elseif ($it.BootDelayMs -ge 1000 -or $it.MemoryMB -ge 150 -or $it.CpuSec -ge 600) { 'Medium' } elseif ($it.Running -or $it.BootDelayMs) { 'Low' } else { '' }
         Measure-PssRisk $it
+        Set-PssPermissions $it
     }
     $rank = @{ High = 0; Medium = 1; Low = 2; OK = 3 }
     $sorted = @($items | Sort-Object @{ E = { $rank[$_.Risk] } }, @{ E = { $_.IsMicrosoft } }, Category, Name)
@@ -973,6 +995,10 @@ function Get-PssDetailFields($it) {
         if ($it.BootDelayLast) { $f['Boot delay'] += (', last on {0:yyyy-MM-dd}' -f $it.BootDelayLast) }
     }
     if ($it.Sha256) { $f['SHA-256'] = $it.Sha256 }
+    $ch = @()
+    if ($it.CanDisable) { $ch += $(if ($it.Enabled) { 'Disable' } else { 'Enable' }) }
+    if ($it.CanDelete) { $ch += 'Delete' }
+    if ($ch) { $f['Changes'] = ($ch -join ', ') + ' available' } elseif ($it.ActionNote) { $f['Changes'] = $it.ActionNote }
     $f['Risk'] = "$($it.Risk) (score $($it.RiskScore))"
     if ($it.Flags) { $f['Flags'] = $it.Flags }
     return $f
@@ -1098,6 +1124,406 @@ q.oninput=f;ms.onchange=f;f();
 </script></body></html>
 '@)
     [IO.File]::WriteAllText($Path, $sb.ToString(), (New-Object System.Text.UTF8Encoding $false))
+}
+
+# ======================================================================================
+#  Changes: Disable / Enable / Delete with backups, and Undo
+#  Every change writes an undo record to %ProgramData%\PaxStartupScanner\Backups before
+#  anything is touched; the record is removed again if the change fails.
+# ======================================================================================
+
+function Set-PssPermissions($it) {
+    # Decides what may be changed. Windows' own parts are protected; user-level autostarts are not.
+    $it.CanDisable = $false; $it.CanDelete = $false; $it.ActionNote = ''
+    $op = $it.Op
+    if ($it.State -eq 'Removed') { $it.ActionNote = 'Removed in this session. Undo can bring it back.'; return }
+    if (-not $op) { $it.ActionNote = "This entry can't be changed from here."; return }
+    if ($op.Type -eq 'Blocked') { $it.ActionNote = $op.Note; return }
+    $cleanMs = $it.IsMicrosoft -and $it.Risk -eq 'OK'
+    switch ($it.Category) {
+        { $_ -in 'Run Key', 'RunOnce', 'Policy Run' } { $it.CanDelete = $true; $it.CanDisable = [bool]$op.ApprovedKind; break }
+        'Startup Folder' { $it.CanDelete = $true; $it.CanDisable = [bool]$op.ApprovedRoot; break }
+        'Store App' { if ($op.ByPolicy) { $it.ActionNote = 'Controlled by policy.' } else { $it.CanDisable = $true }; break }
+        'Scheduled Task' {
+            if ($cleanMs -and $it.Name -like '\Microsoft\Windows\*') { $it.ActionNote = 'Windows system task, left alone to keep Windows healthy.' }
+            else { $it.CanDisable = $true; $it.CanDelete = $true }
+            break
+        }
+        'Service' { if ($cleanMs) { $it.ActionNote = 'Windows service, left alone to keep Windows healthy.' } else { $it.CanDisable = $true }; break }
+        'Driver' {
+            if ($op.Start -eq 'boot') { $it.ActionNote = "Boot driver. Windows may not start without it, so it can't be changed here." }
+            elseif ($cleanMs) { $it.ActionNote = 'Windows driver, left alone to keep Windows healthy.' }
+            else { $it.CanDisable = $true }
+            break
+        }
+        { $_ -in 'Winlogon', 'Boot Execute' } { if ($it.Kind -eq 'Default') { $it.ActionNote = 'Windows default value. Windows needs it.' } else { $it.CanDelete = $true }; break }
+        { $_ -in 'LSA', 'Explorer', 'Print Monitor', 'Netsh', 'Active Setup' } { if ($cleanMs) { $it.ActionNote = 'Part of Windows, left alone.' } else { $it.CanDelete = $true }; break }
+        default { $it.CanDelete = $true }
+    }
+    if (-not $it.CanDisable -and -not $it.CanDelete -and -not $it.ActionNote) { $it.ActionNote = "This entry can't be changed from here." }
+}
+
+function Get-PssBackupPath { return (Join-Path $env:ProgramData 'PaxStartupScanner\Backups') }
+
+function Get-PssBackupDir {
+    $d = Get-PssBackupPath
+    if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force -ErrorAction Stop | Out-Null }
+    return $d
+}
+
+function New-PssBackupName([string]$Suffix) {
+    # Sortable to 100 ns so the newest change is always listed first
+    return ('{0:yyyyMMdd-HHmmss-fffffff}-{1}{2}' -f (Get-Date), ([guid]::NewGuid().ToString('N').Substring(0, 4)), $Suffix)
+}
+
+function Open-PssKeyW([string]$Path, [switch]$Create) {
+    Initialize-PssRegistry
+    $i = $Path.IndexOf('\')
+    $hive = $Path.Substring(0, $i); $sub = $Path.Substring($i + 1)
+    $base = $null
+    if ($hive -eq 'HKLM') { $base = $script:PssHKLM } elseif ($hive -eq 'HKU') { $base = $script:PssHKU }
+    if (-not $base) { throw "Unsupported registry path: $Path" }
+    $k = if ($Create) { $base.CreateSubKey($sub) } else { $base.OpenSubKey($sub, $true) }
+    if (-not $k) { throw "Registry key not found: $Path" }
+    return $k
+}
+
+function Backup-PssRegValue($Key, [string]$KeyPath, [string]$Name) {
+    $step = @{ T = 'RegValue'; Key = $KeyPath; Name = $Name; Existed = $false; Kind = ''; Data = $null }
+    if ($Key.GetValueNames() -contains $Name) {
+        $kind = $Key.GetValueKind($Name)
+        $data = $Key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $step.Existed = $true; $step.Kind = [string]$kind
+        switch ([string]$kind) {
+            'Binary' { $step.Data = [Convert]::ToBase64String([byte[]]$data) }
+            'MultiString' { $step.Data = @([string[]]$data) }
+            'DWord' { $step.Data = [int]$data }
+            'QWord' { $step.Data = [long]$data }
+            default { $step.Data = [string]$data }
+        }
+    }
+    return $step
+}
+
+function Restore-PssRegValue($s) {
+    $k = Open-PssKeyW $s.Key -Create
+    try {
+        if ($s.Existed) {
+            $kind = [Microsoft.Win32.RegistryValueKind]$s.Kind
+            switch ($s.Kind) {
+                'Binary' { $k.SetValue($s.Name, [byte[]][Convert]::FromBase64String([string]$s.Data), $kind) }
+                'MultiString' { $k.SetValue($s.Name, [string[]]@($s.Data | Where-Object { $null -ne $_ }), $kind) }
+                'DWord' { $k.SetValue($s.Name, [int]$s.Data, $kind) }
+                'QWord' { $k.SetValue($s.Name, [long]$s.Data, $kind) }
+                default { $k.SetValue($s.Name, [string]$s.Data, $kind) }
+            }
+        } else { $k.DeleteValue($s.Name, $false) }
+    } finally { $k.Close() }
+}
+
+function Save-PssUndo($it, [string]$Action, $Steps) {
+    # $Steps is a List[object]; use ToArray() because @($list) on a List[object] throws
+    # "Argument types do not match" in Windows PowerShell 5.1
+    $rec = [pscustomobject][ordered]@{
+        Version = 1; Time = (Get-Date).ToString('o'); Computer = $env:COMPUTERNAME; RunBy = "$env:USERDOMAIN\$env:USERNAME"
+        Action = $Action; Category = $it.Category; Name = $it.Name; Location = $it.Location; ValueName = $it.ValueName; Command = $it.Command
+        Steps = $Steps.ToArray()
+    }
+    $file = Join-Path (Get-PssBackupDir) (New-PssBackupName '.json')
+    $rec | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $file -Encoding UTF8 -ErrorAction Stop
+    return $file
+}
+
+function Complete-PssChange([string]$Record, [scriptblock]$Apply, [string[]]$Cleanup = @()) {
+    # Runs the change; if it fails, the undo record (and any backup files) are removed so nothing is left half-done
+    try { $null = & $Apply }
+    catch {
+        Remove-Item -LiteralPath $Record -ErrorAction SilentlyContinue
+        foreach ($c in $Cleanup) { if ($c) { Remove-Item -LiteralPath $c -ErrorAction SilentlyContinue } }
+        throw
+    }
+}
+
+function Set-PssApprovedFlag($it, [string]$Action, [string]$Root, [string]$Kind, [string]$Name, $Steps) {
+    # Task Manager's switch: byte 0 = 2 enabled, 3 disabled (+ FILETIME of when it was disabled)
+    $path = "$Root\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\$Kind"
+    $k = Open-PssKeyW $path -Create
+    try {
+        $Steps.Add((Backup-PssRegValue $k $path $Name))
+        $rec = Save-PssUndo $it $Action $Steps
+        $bytes = New-Object byte[] 12
+        if ($Action -eq 'Enable') { $bytes[0] = 2 } else { $bytes[0] = 3; [BitConverter]::GetBytes((Get-Date).ToFileTime()).CopyTo($bytes, 4) }
+        Complete-PssChange $rec { $k.SetValue($Name, $bytes, [Microsoft.Win32.RegistryValueKind]::Binary) }
+        return $rec
+    } finally { $k.Close() }
+}
+
+function Get-PssTask([string]$Path) {
+    $svc = New-Object -ComObject Schedule.Service
+    $svc.Connect()
+    $i = $Path.LastIndexOf('\')
+    $folderPath = if ($i -le 0) { '\' } else { $Path.Substring(0, $i) }
+    $name = $Path.Substring($i + 1)
+    $folder = $svc.GetFolder($folderPath)
+    return @{ Folder = $folder; FolderPath = $folderPath; Name = $name; Task = $folder.GetTask($name) }
+}
+
+function Set-PssServiceStart([string]$Name, [string]$Start) {
+    $out = & sc.exe config "$Name" start= $Start 2>&1
+    if ($LASTEXITCODE -ne 0) { throw ((($out | Out-String) -replace '\s+', ' ').Trim()) }
+}
+
+function Get-PssListWithout($Key, $Op) {
+    # The value with this item's part removed: @{ Value = new data or $null to delete; Kind }
+    if ($Key.GetValueNames() -notcontains $Op.Name) { throw "The $($Op.Name) value is already gone." }
+    $kind = $Key.GetValueKind($Op.Name)
+    $cur = $Key.GetValue($Op.Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    $part = ([string]$Op.Part).Trim()
+    $empty = $(if ($Op.Default) { $Op.Default } else { $null })
+    if ($kind -eq [Microsoft.Win32.RegistryValueKind]::MultiString) {
+        $list = New-Object System.Collections.Generic.List[string]; $found = $false
+        foreach ($e in @($cur)) {
+            $e2 = [string]$e
+            if (-not $found -and $e2.Trim() -ieq $part) { $found = $true; continue }
+            if (-not $found) {
+                $tokens = @($e2 -split '\s+' | Where-Object { $_ })
+                if ($tokens.Count -gt 1 -and ($tokens -icontains $part)) { $e2 = (@($tokens | Where-Object { $_ -ine $part }) -join ' '); $found = $true }
+            }
+            if ($e2) { $list.Add($e2) }
+        }
+        if (-not $found) { throw "'$part' isn't in $($Op.Name) any more." }
+        if ($list.Count -eq 0) { return @{ Value = $null; Kind = $kind } }
+        return @{ Value = [string[]]$list.ToArray(); Kind = $kind }
+    }
+    $s = [string]$cur
+    if ($Op.Sep -eq 'multi') {
+        if ($s.Trim() -ine $part) { throw "'$part' isn't in $($Op.Name) any more." }
+        return @{ Value = $empty; Kind = $kind }
+    }
+    $splitter = if ($Op.Sep -eq ' ') { '[,\s]+' } else { ',' }
+    $trail = $s.TrimEnd().EndsWith(',')
+    $parts = @($s -split $splitter | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $idx = -1
+    for ($i = 0; $i -lt $parts.Count; $i++) { if ($parts[$i] -ieq $part) { $idx = $i; break } }
+    if ($idx -lt 0) { throw "'$part' isn't in $($Op.Name) any more." }
+    $rest = @(for ($i = 0; $i -lt $parts.Count; $i++) { if ($i -ne $idx) { $parts[$i] } })
+    if ($rest.Count -eq 0) { return @{ Value = $empty; Kind = $kind } }
+    $joined = $rest -join $(if ($Op.Sep -eq ' ') { ' ' } else { ',' })
+    if ($trail) { $joined += ',' }
+    return @{ Value = $joined; Kind = $kind }
+}
+
+function Format-PssError($Err) {
+    $ex = $Err.Exception
+    while ($ex.InnerException) { $ex = $ex.InnerException }
+    $msg = [string]$ex.Message
+    if ($ex -is [UnauthorizedAccessException] -or $ex -is [System.Security.SecurityException] -or $msg -match '(?i)access (is )?denied|0x80070005|FAILED 5:') {
+        return 'Access denied. Run PowerShell as Administrator to change this item.'
+    }
+    return $msg.Trim()
+}
+
+function Get-PssConfirmText($it, [string]$Action) {
+    $where = $it.Location; if ($it.ValueName) { $where += " -> $($it.ValueName)" }
+    $what = "$($it.Name)`n$($it.Category): $where"
+    $sys = $it.Category -in 'Winlogon', 'Boot Execute', 'LSA', 'AppInit', 'Print Monitor', 'Explorer', 'Netsh', 'Driver'
+    switch ($Action) {
+        'Disable' {
+            $t = "Disable this startup item?`n`n$what`n`n"
+            if ($it.Category -in 'Service', 'Driver') { $t += "Windows won't start it at boot any more. It keeps running until the next restart. Software that relies on it may stop working.`n`n" }
+            else { $t += "It stays installed but won't start automatically. You can enable it again later.`n`n" }
+        }
+        'Enable' { $t = "Enable this startup item again?`n`n$what`n`n" }
+        default {
+            $t = "Delete this startup entry?`n`n$what`n`nThe program itself isn't uninstalled; only the entry that starts it is removed.`n"
+            if ($sys) { $t += "This is a sensitive system setting. Only remove it if you're sure it doesn't belong there.`n" }
+            if ($it.Category -eq 'WMI') { $t += "WMI subscriptions can't be restored automatically; the definition is saved for reference.`n" }
+            $t += "`n"
+        }
+    }
+    $t += "A backup is saved to $(Get-PssBackupPath) so you can undo this."
+    return $t
+}
+
+function Invoke-PssChange($it, [string]$Action) {
+    # Action: Disable | Enable | Delete. Returns @{ Ok; Message; Record }
+    if ($it.State -eq 'Removed') { return @{ Ok = $false; Message = 'This item was already removed.'; Record = '' } }
+    if ($Action -eq 'Delete' -and -not $it.CanDelete) { return @{ Ok = $false; Message = $(if ($it.ActionNote) { $it.ActionNote } else { "This entry can't be deleted here." }); Record = '' } }
+    if ($Action -ne 'Delete' -and -not $it.CanDisable) { return @{ Ok = $false; Message = $(if ($it.ActionNote) { $it.ActionNote } else { "This entry can't be disabled, only deleted." }); Record = '' } }
+    $op = $it.Op
+    $steps = New-Object System.Collections.Generic.List[object]
+    $rec = ''
+    try {
+        Initialize-PssRegistry
+        $null = Get-PssBackupDir
+        switch ($op.Type) {
+            'RegValue' {
+                if ($Action -eq 'Delete') {
+                    $k = Open-PssKeyW $op.Key
+                    try {
+                        if ($k.GetValueNames() -notcontains $op.Name) { throw 'The entry is already gone.' }
+                        $steps.Add((Backup-PssRegValue $k $op.Key $op.Name))
+                        $rec = Save-PssUndo $it $Action $steps
+                        Complete-PssChange $rec { $k.DeleteValue($op.Name) }
+                    } finally { $k.Close() }
+                } else { $rec = Set-PssApprovedFlag $it $Action $op.ApprovedRoot $op.ApprovedKind $op.Name $steps }
+            }
+            'File' {
+                if ($Action -eq 'Delete') {
+                    if (-not (Test-Path -LiteralPath $op.Path)) { throw 'The file is already gone.' }
+                    $dest = Join-Path (Get-PssBackupDir) (New-PssBackupName ('_' + [IO.Path]::GetFileName($op.Path)))
+                    $steps.Add(@{ T = 'File'; From = $dest; To = $op.Path })
+                    $rec = Save-PssUndo $it $Action $steps
+                    Complete-PssChange $rec { Move-Item -LiteralPath $op.Path -Destination $dest -ErrorAction Stop }
+                } else { $rec = Set-PssApprovedFlag $it $Action $op.ApprovedRoot 'StartupFolder' $op.ApprovedName $steps }
+            }
+            'Task' {
+                $t = Get-PssTask $op.Path
+                if ($Action -eq 'Delete') {
+                    $steps.Add(@{ T = 'Task'; Path = $op.Path; Xml = [string]$t.Task.Xml })
+                    $rec = Save-PssUndo $it $Action $steps
+                    Complete-PssChange $rec { $t.Folder.DeleteTask($t.Name, 0) }
+                } else {
+                    $steps.Add(@{ T = 'TaskEnabled'; Path = $op.Path; Enabled = [bool]$t.Task.Enabled })
+                    $rec = Save-PssUndo $it $Action $steps
+                    Complete-PssChange $rec { $t.Task.Enabled = ($Action -eq 'Enable') }
+                }
+            }
+            'Service' {
+                $target = if ($Action -eq 'Disable') { 'disabled' } else { $op.Start }
+                $steps.Add(@{ T = 'Service'; Name = $op.Name; Start = $(if ($Action -eq 'Disable') { $op.Start } else { 'disabled' }) })
+                $rec = Save-PssUndo $it $Action $steps
+                Complete-PssChange $rec { Set-PssServiceStart $op.Name $target }
+            }
+            'StoreApp' {
+                $k = Open-PssKeyW $op.Key
+                try {
+                    $steps.Add((Backup-PssRegValue $k $op.Key 'State'))
+                    $rec = Save-PssUndo $it $Action $steps
+                    Complete-PssChange $rec { $k.SetValue('State', $(if ($Action -eq 'Enable') { 2 } else { 1 }), [Microsoft.Win32.RegistryValueKind]::DWord) }
+                } finally { $k.Close() }
+            }
+            'RegKey' {
+                $file = Join-Path (Get-PssBackupDir) (New-PssBackupName '.reg')
+                $out = & reg.exe export $op.Key $file /y /reg:64 2>&1
+                if ($LASTEXITCODE -ne 0) { throw "Couldn't back up $($op.Key): $((($out | Out-String) -replace '\s+', ' ').Trim())" }
+                $steps.Add(@{ T = 'RegImport'; File = $file; Key = $op.Key })
+                $rec = Save-PssUndo $it $Action $steps
+                $i = $op.Key.LastIndexOf('\')
+                Complete-PssChange $rec {
+                    $parent = Open-PssKeyW $op.Key.Substring(0, $i)
+                    try { $parent.DeleteSubKeyTree($op.Key.Substring($i + 1), $false) } finally { $parent.Close() }
+                } @($file)
+            }
+            'ListPart' {
+                $k = Open-PssKeyW $op.Key
+                try {
+                    $steps.Add((Backup-PssRegValue $k $op.Key $op.Name))
+                    $new = Get-PssListWithout $k $op
+                    $rec = Save-PssUndo $it $Action $steps
+                    Complete-PssChange $rec {
+                        if ($null -eq $new.Value) { $k.DeleteValue($op.Name, $false) } else { $k.SetValue($op.Name, $new.Value, $new.Kind) }
+                    }
+                } finally { $k.Close() }
+            }
+            'Wmi' {
+                $ns = 'root\subscription'
+                $consumer = @(Get-CimInstance -Namespace $ns -ClassName $op.Class -ErrorAction Stop | Where-Object { $_.Name -eq $op.Name }) | Select-Object -First 1
+                if (-not $consumer) { throw 'The WMI subscription is already gone.' }
+                $bindings = @(Get-CimInstance -Namespace $ns -ClassName __FilterToConsumerBinding -ErrorAction Stop | Where-Object { $_.Consumer.Name -eq $op.Name })
+                $allFilters = @(Get-CimInstance -Namespace $ns -ClassName __EventFilter -ErrorAction SilentlyContinue)
+                $filters = @($allFilters | Where-Object { $bindings.Filter.Name -contains $_.Name })
+                $info = @{
+                    ConsumerClass = $op.Class; ConsumerName = $op.Name
+                    CommandLineTemplate = [string]$consumer.CommandLineTemplate; ExecutablePath = [string]$consumer.ExecutablePath
+                    ScriptingEngine = [string]$consumer.ScriptingEngine; ScriptFileName = [string]$consumer.ScriptFileName; ScriptText = [string]$consumer.ScriptText
+                    Filters = @($filters | ForEach-Object { @{ Name = $_.Name; Query = $_.Query; QueryLanguage = $_.QueryLanguage; EventNamespace = $_.EventNamespace } })
+                }
+                $steps.Add(@{ T = 'Wmi'; Info = $info })
+                $rec = Save-PssUndo $it $Action $steps
+                foreach ($b in $bindings) { Remove-CimInstance -InputObject $b -ErrorAction Stop }
+                foreach ($f in $filters) {
+                    $still = @(Get-CimInstance -Namespace $ns -ClassName __FilterToConsumerBinding -ErrorAction SilentlyContinue | Where-Object { $_.Filter.Name -eq $f.Name })
+                    if (-not $still) { Remove-CimInstance -InputObject $f -ErrorAction Stop }
+                }
+                Remove-CimInstance -InputObject $consumer -ErrorAction Stop
+            }
+            default { throw "This entry can't be changed from here." }
+        }
+    } catch {
+        # A WMI record stays even after a partial removal: it is the only copy of what was there
+        if ($rec -and $op.Type -ne 'Wmi') { Remove-Item -LiteralPath $rec -ErrorAction SilentlyContinue }
+        return @{ Ok = $false; Message = (Format-PssError $_); Record = '' }
+    }
+    switch ($Action) {
+        'Disable' { $it.Enabled = $false; $it.EnabledText = 'No' }
+        'Enable' { $it.Enabled = $true; $it.EnabledText = 'Yes' }
+        default { $it.State = 'Removed'; $it.Enabled = $false; $it.EnabledText = 'Removed' }
+    }
+    Set-PssPermissions $it
+    $msg = switch ($Action) {
+        'Disable' { if ($it.Category -in 'Service', 'Driver') { "Disabled $($it.Name). It won't start with Windows after the next restart." } else { "Disabled $($it.Name). It won't start automatically any more." } }
+        'Enable' { "Enabled $($it.Name) again." }
+        default { if ($op.Type -eq 'Wmi') { "Removed the WMI subscription $($it.Name). Its definition is saved in the backup folder." } else { "Deleted the startup entry for $($it.Name). Undo can put it back." } }
+    }
+    return @{ Ok = $true; Message = $msg; Record = $rec }
+}
+
+function Get-PssUndoRecords {
+    $dir = Get-PssBackupPath
+    if (-not (Test-Path -LiteralPath $dir)) { return @() }
+    $out = @()
+    foreach ($f in (Get-ChildItem -LiteralPath $dir -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object Name -Descending)) {
+        try {
+            $r = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction Stop | ConvertFrom-Json
+            $when = ''; try { $when = ([datetime]::Parse([string]$r.Time)).ToString('yyyy-MM-dd HH:mm') } catch {}
+            $r | Add-Member -NotePropertyName File -NotePropertyValue $f.FullName -Force
+            $r | Add-Member -NotePropertyName When -NotePropertyValue $when -Force
+            $out += $r
+        } catch {}
+    }
+    return $out
+}
+
+function Invoke-PssUndo($Rec) {
+    # Replays the record's backup steps in reverse, then files the record under Backups\Restored
+    $steps = @($Rec.Steps)
+    [array]::Reverse($steps)
+    try {
+        Initialize-PssRegistry
+        foreach ($s in $steps) {
+            switch ($s.T) {
+                'RegValue' { Restore-PssRegValue $s }
+                'File' {
+                    if (Test-Path -LiteralPath $s.To) { throw "A file already exists at $($s.To)." }
+                    if (-not (Test-Path -LiteralPath $s.From)) { throw "The backup file is missing: $($s.From)" }
+                    $parent = Split-Path -Parent $s.To
+                    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null }
+                    Move-Item -LiteralPath $s.From -Destination $s.To -ErrorAction Stop
+                }
+                'Task' {
+                    $i = $s.Path.LastIndexOf('\')
+                    $folder = if ($i -le 0) { '\' } else { $s.Path.Substring(0, $i) + '\' }
+                    Register-ScheduledTask -Xml ([string]$s.Xml) -TaskName $s.Path.Substring($i + 1) -TaskPath $folder -Force -ErrorAction Stop | Out-Null
+                }
+                'TaskEnabled' { $t = Get-PssTask $s.Path; $t.Task.Enabled = [bool]$s.Enabled }
+                'Service' { Set-PssServiceStart $s.Name $s.Start }
+                'RegImport' {
+                    $out = & reg.exe import $s.File /reg:64 2>&1
+                    if ($LASTEXITCODE -ne 0) { throw "reg import failed: $((($out | Out-String) -replace '\s+', ' ').Trim())" }
+                }
+                'Wmi' { throw "WMI subscriptions aren't restored automatically. The removed definition is saved in $($Rec.File)." }
+                default { throw "Unknown backup step '$($s.T)'." }
+            }
+        }
+    } catch { return @{ Ok = $false; Message = (Format-PssError $_) } }
+    try {
+        $done = Join-Path (Get-PssBackupPath) 'Restored'
+        if (-not (Test-Path -LiteralPath $done)) { New-Item -ItemType Directory -Path $done -Force | Out-Null }
+        Move-Item -LiteralPath $Rec.File -Destination $done -Force -ErrorAction Stop
+    } catch {}
+    $verb = switch ($Rec.Action) { 'Delete' { 'deletion' } 'Disable' { 'disabling' } 'Enable' { 'enabling' } default { 'change' } }
+    return @{ Ok = $true; Message = "Undid the $verb of $($Rec.Name). Rescan to see it in the list again." }
 }
 
 # ======================================================================================
@@ -1251,7 +1677,7 @@ function Write-PssTable($Items, [string]$Title, [switch]$NoPaging) {
         Write-Host (Format-PssCell $it.Category 14) -NoNewline -ForegroundColor DarkCyan
         Write-Host ' ' -NoNewline
         $nameCol = if ($dim) { 'DarkGray' } elseif (-not $it.Enabled) { 'DarkGray' } else { 'White' }
-        $nm = $it.Name; if (-not $it.Enabled) { $nm = "$nm [off]" }
+        $nm = $it.Name; if ($it.State -eq 'Removed') { $nm = "$nm [removed]" } elseif (-not $it.Enabled) { $nm = "$nm [off]" }
         Write-Host (Format-PssCell $nm $wName) -NoNewline -ForegroundColor $nameCol
         Write-Host ' ' -NoNewline
         $pubCol = if ($it.SignStatus -eq 'Valid') { 'Gray' } elseif ($it.NoImage) { 'DarkGray' } else { 'Yellow' }
@@ -1297,9 +1723,34 @@ function Show-PssDetails($Scan, [int]$Id) {
         }
         Write-PssRule
         Write-Host '   [O] Open location  [F] Show file  [H] SHA-256  [V] VirusTotal  [S] Search web  [C] Copy  [Enter] Back' -ForegroundColor Cyan
+        if ($it.CanDisable -or $it.CanDelete) {
+            Write-Host '   ' -NoNewline
+            if ($it.CanDisable) { Write-Host ('[D] ' + $(if ($it.Enabled) { 'Disable at startup' } else { 'Enable at startup' }) + '   ') -NoNewline -ForegroundColor Yellow }
+            if ($it.CanDelete) { Write-Host '[X] Delete entry   ' -NoNewline -ForegroundColor Red }
+            Write-Host 'Backups and Undo: [U] in the main menu' -ForegroundColor DarkGray
+        }
         Write-Host '   > ' -NoNewline -ForegroundColor Cyan
         $k = Read-PssKey
         switch -Regex ($k) {
+            '^(?i)[dx]$' {
+                $action = if ($k -match '^(?i)x$') { 'Delete' } elseif ($it.Enabled) { 'Disable' } else { 'Enable' }
+                $allowed = if ($action -eq 'Delete') { $it.CanDelete } else { $it.CanDisable }
+                if (-not $allowed) {
+                    $why = if ($it.ActionNote) { $it.ActionNote } elseif ($action -eq 'Delete') { "This entry can't be deleted here." } else { "This entry can't be disabled, only deleted." }
+                    Write-Host "   $why" -ForegroundColor Yellow; Start-Sleep 2; break
+                }
+                Write-Host ''
+                $lines = (Get-PssConfirmText $it $action) -split "`n"
+                Write-Host "   $($lines[0])" -ForegroundColor $(if ($action -eq 'Delete') { 'Red' } else { 'Yellow' })
+                foreach ($l in ($lines | Select-Object -Skip 1)) { Write-Host "   $l" -ForegroundColor Gray }
+                Write-Host ''
+                Write-Host '   Type Y to confirm > ' -NoNewline -ForegroundColor Cyan
+                if ((Read-PssKey) -match '^(?i)y(es)?$') {
+                    $res = Invoke-PssChange $it $action
+                    Write-Host "   $($res.Message)" -ForegroundColor $(if ($res.Ok) { 'Green' } else { 'Red' })
+                    if ($res.Ok) { Start-Sleep -Milliseconds 1500 } else { Write-Host '   Press Enter to continue > ' -NoNewline -ForegroundColor Cyan; $null = Read-PssKey }
+                }
+            }
             '^(?i)o$' { Open-PssLocation $it }
             '^(?i)f$' { Open-PssFolder $it }
             '^(?i)h$' { if (-not (Get-PssHash $it)) { Write-Host "   $($script:PssHashError)" -ForegroundColor Yellow; Start-Sleep 2 } }
@@ -1431,6 +1882,43 @@ function Invoke-PssConsoleScan {
     return $scan
 }
 
+function Show-PssUndo($Scan) {
+    # Lists saved changes; returns $true when something was restored (so the caller can rescan)
+    $restored = $false
+    while ($true) {
+        Write-PssHeader $Scan
+        $recs = @(Get-PssUndoRecords)
+        Write-PssRule "Saved changes ($($recs.Count))"
+        if (-not $recs) {
+            Write-Host '   No saved changes on this PC.' -ForegroundColor DarkGray
+            Write-Host ''
+            Write-Host '   Press Enter to go back > ' -NoNewline -ForegroundColor Cyan; $null = Read-PssKey
+            return $restored
+        }
+        Write-Host ('   {0,-5}{1,-18}{2,-9}{3,-16}{4}' -f '#', 'When', 'Change', 'Category', 'Name') -ForegroundColor DarkGray
+        for ($i = 0; $i -lt $recs.Count; $i++) {
+            $r = $recs[$i]
+            Write-Host ('   [{0,2}] ' -f ($i + 1)) -NoNewline -ForegroundColor Cyan
+            Write-Host ('{0,-18}' -f $r.When) -NoNewline -ForegroundColor Gray
+            Write-Host ('{0,-9}' -f $r.Action) -NoNewline -ForegroundColor $(if ($r.Action -eq 'Delete') { 'Red' } else { 'Yellow' })
+            Write-Host (Format-PssCell $r.Category 15) -NoNewline -ForegroundColor DarkCyan
+            Write-Host (' ' + $r.Name) -ForegroundColor White
+        }
+        Write-Host ''
+        Write-Host "   Backups are kept in $(Get-PssBackupPath)" -ForegroundColor DarkGray
+        Write-Host '   Number to undo, or Enter to go back > ' -NoNewline -ForegroundColor Cyan
+        $k = Read-PssKey
+        if ($k -notmatch '^\d+$' -or [int]$k -lt 1 -or [int]$k -gt $recs.Count) { return $restored }
+        $r = $recs[[int]$k - 1]
+        Write-Host "   Undo the $($r.Action.ToLower()) of '$($r.Name)'? Type Y to confirm > " -NoNewline -ForegroundColor Yellow
+        if ((Read-PssKey) -match '^(?i)y(es)?$') {
+            $res = Invoke-PssUndo $r
+            Write-Host "   $($res.Message)" -ForegroundColor $(if ($res.Ok) { 'Green' } else { 'Red' })
+            if ($res.Ok) { $restored = $true; Start-Sleep -Milliseconds 1500 } else { Write-Host '   Press Enter to continue > ' -NoNewline -ForegroundColor Cyan; $null = Read-PssKey }
+        }
+    }
+}
+
 function Start-PssConsole($Scan) {
     while ($true) {
         Write-PssHeader $Scan
@@ -1443,7 +1931,8 @@ function Start-PssConsole($Scan) {
             @('2', "Third-party startup items ($tp)"), @('6', 'Boot performance / slowdowns'),
             @('3', 'Browse by category'), @('E', 'Export report (HTML/CSV/JSON)'),
             @('4', "All items incl. Microsoft ($($Scan.Items.Count))"), @('G', 'Open GUI view'),
-            @('M', $(if ($script:PssShowMicrosoft) { 'Browse/search: hide Microsoft' } else { 'Browse/search: show Microsoft' })), @('R', 'Rescan')
+            @('M', $(if ($script:PssShowMicrosoft) { 'Browse/search: hide Microsoft' } else { 'Browse/search: show Microsoft' })), @('R', 'Rescan'),
+            @('U', "Undo a change ($(@(Get-PssUndoRecords).Count) saved)"), @('Q', 'Quit')
         )
         for ($i = 0; $i -lt $menu.Count; $i += 2) {
             foreach ($m in $menu[$i], $menu[$i + 1]) {
@@ -1453,8 +1942,7 @@ function Start-PssConsole($Scan) {
             }
             Write-Host ''
         }
-        Write-Host '   [' -NoNewline -ForegroundColor DarkGray; Write-Host 'Q' -NoNewline -ForegroundColor Cyan; Write-Host '] Quit' -NoNewline -ForegroundColor Gray
-        Write-Host '          Type an item number at any prompt to see its details' -ForegroundColor DarkGray
+        Write-Host '   Type an item number at any prompt to see its details, then D to disable or X to delete it' -ForegroundColor DarkGray
         Write-Host ''
         Write-Host '   > ' -NoNewline -ForegroundColor Cyan
         $k = Read-PssKey
@@ -1477,6 +1965,7 @@ function Start-PssConsole($Scan) {
             '^(?i)g$' { $Scan = Show-PssGui $Scan ; break }
             '^(?i)m$' { $script:PssShowMicrosoft = -not $script:PssShowMicrosoft ; break }
             '^(?i)r$' { Write-PssHeader $null; $Scan = Invoke-PssConsoleScan ; break }
+            '^(?i)u$' { if (Show-PssUndo $Scan) { Write-PssHeader $null; $Scan = Invoke-PssConsoleScan }; break }
             '^(?i)(q|quit|exit)$' { Write-Host ''; return }
             '^\d+$' { Show-PssDetails $Scan ([int]$k) }
         }
@@ -1487,8 +1976,8 @@ function Start-PssConsole($Scan) {
 #  GUI (WPF)
 # ======================================================================================
 
-function Show-PssGui($Scan, [string]$Snapshot) {
-    # -Snapshot <png>: render the window off-screen to an image instead of showing it (self-test)
+function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
+    # -Snapshot <png>: render the window off-screen to an image instead of showing it (self-test, README screenshots)
     if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
         Write-Host '   The GUI needs an STA thread. Opening it in Windows PowerShell...' -ForegroundColor Yellow
         if ($script:PssSelfPath) { $cmd = "& '$($script:PssSelfPath)' -Gui" } else { $cmd = "& ([scriptblock]::Create((irm '$($script:PssUrl)'))) -Gui" }
@@ -1515,6 +2004,9 @@ function Show-PssGui($Scan, [string]$Snapshot) {
         <Trigger Property="IsEnabled" Value="False"><Setter TargetName="b" Property="Opacity" Value="0.45"/></Trigger></ControlTemplate.Triggers>
       </ControlTemplate></Setter.Value></Setter>
     </Style>
+    <Style x:Key="Danger" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+      <Setter Property="Background" Value="#3A1D22"/><Setter Property="BorderBrush" Value="#7A2E38"/><Setter Property="Foreground" Value="#FFC9CE"/>
+    </Style>
     <Style TargetType="CheckBox"><Setter Property="Foreground" Value="#C9CEDA"/><Setter Property="VerticalAlignment" Value="Center"/><Setter Property="Margin" Value="0,0,14,0"/></Style>
     <Style TargetType="TextBox"><Setter Property="Background" Value="#171A21"/><Setter Property="Foreground" Value="#E6E8EE"/><Setter Property="BorderBrush" Value="#30364A"/><Setter Property="CaretBrush" Value="#E6E8EE"/><Setter Property="Padding" Value="6,4"/></Style>
     <Style TargetType="DataGridColumnHeader">
@@ -1539,6 +2031,7 @@ function Show-PssGui($Scan, [string]$Snapshot) {
         <DataTrigger Binding="{Binding IsMicrosoft}" Value="True"><Setter Property="Foreground" Value="#7D8597"/></DataTrigger>
         <DataTrigger Binding="{Binding Risk}" Value="High"><Setter Property="Foreground" Value="#FF7B7B"/></DataTrigger>
         <DataTrigger Binding="{Binding Risk}" Value="Medium"><Setter Property="Foreground" Value="#FBBF24"/></DataTrigger>
+        <DataTrigger Binding="{Binding State}" Value="Removed"><Setter Property="Foreground" Value="#59606F"/><Setter Property="FontStyle" Value="Italic"/></DataTrigger>
         <Trigger Property="IsSelected" Value="True"><Setter Property="Background" Value="#1E3A5F"/></Trigger>
       </Style.Triggers>
     </Style>
@@ -1599,7 +2092,7 @@ function Show-PssGui($Scan, [string]$Snapshot) {
       <Button x:Name="BtnRescan" DockPanel.Dock="Right">Rescan</Button>
     </DockPanel>
     <TextBlock x:Name="Banner" Grid.Row="2" Foreground="#FBBF24" Margin="0,0,0,6" TextWrapping="Wrap" Visibility="Collapsed"/>
-    <TabControl Grid.Row="3" Background="Transparent" BorderThickness="0" Padding="0">
+    <TabControl x:Name="Tabs" Grid.Row="3" Background="Transparent" BorderThickness="0" Padding="0">
       <TabItem Header="Startup items">
         <Grid>
           <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="5"/><RowDefinition Height="230"/></Grid.RowDefinitions>
@@ -1620,10 +2113,16 @@ function Show-PssGui($Scan, [string]$Snapshot) {
           <GridSplitter Grid.Row="1" HorizontalAlignment="Stretch" Background="Transparent"/>
           <Border Grid.Row="2" Background="{StaticResource Card}" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="6" Padding="10">
             <DockPanel>
-              <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" Margin="0,8,0,0">
-                <Button x:Name="BtnLoc">Open location</Button><Button x:Name="BtnFile">Show file</Button>
-                <Button x:Name="BtnVt">VirusTotal</Button><Button x:Name="BtnWeb">Search web</Button><Button x:Name="BtnCopy">Copy details</Button>
-              </StackPanel>
+              <DockPanel DockPanel.Dock="Bottom" Margin="0,8,0,0" LastChildFill="False">
+                <StackPanel DockPanel.Dock="Left" Orientation="Horizontal">
+                  <Button x:Name="BtnLoc">Open location</Button><Button x:Name="BtnFile">Show file</Button>
+                  <Button x:Name="BtnVt">VirusTotal</Button><Button x:Name="BtnWeb">Search web</Button><Button x:Name="BtnCopy">Copy details</Button>
+                </StackPanel>
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                  <Button x:Name="BtnToggle" ToolTipService.ShowOnDisabled="True" IsEnabled="False">Disable</Button>
+                  <Button x:Name="BtnDelete" Style="{StaticResource Danger}" Margin="0" ToolTipService.ShowOnDisabled="True" IsEnabled="False">Delete</Button>
+                </StackPanel>
+              </DockPanel>
               <TextBox x:Name="Detail" IsReadOnly="True" BorderThickness="0" Background="Transparent" FontFamily="Consolas" FontSize="12" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/>
             </DockPanel>
           </Border>
@@ -1654,6 +2153,25 @@ function Show-PssGui($Scan, [string]$Snapshot) {
           </DataGrid>
         </Grid>
       </TabItem>
+      <TabItem x:Name="UndoTab" Header="Undo changes">
+        <DockPanel Margin="0,8,0,0">
+          <TextBlock x:Name="UndoNote" DockPanel.Dock="Top" Foreground="{StaticResource Mut}" Margin="2,0,0,8" TextWrapping="Wrap"/>
+          <DockPanel DockPanel.Dock="Bottom" Margin="0,8,0,0" LastChildFill="False">
+            <Button x:Name="BtnUndoSel" DockPanel.Dock="Left" IsEnabled="False">Undo selected change</Button>
+            <Button x:Name="BtnUndoFolder" DockPanel.Dock="Left">Open backup folder</Button>
+            <Button x:Name="BtnUndoRefresh" DockPanel.Dock="Left">Refresh</Button>
+          </DockPanel>
+          <DataGrid x:Name="UndoGrid">
+            <DataGrid.Columns>
+              <DataGridTextColumn Header="When" Binding="{Binding When}" Width="140"/>
+              <DataGridTextColumn Header="Change" Binding="{Binding Action}" Width="80"/>
+              <DataGridTextColumn Header="Category" Binding="{Binding Category}" Width="130"/>
+              <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="*" MinWidth="380"/>
+              <DataGridTextColumn Header="By" Binding="{Binding RunBy}" Width="200"/>
+            </DataGrid.Columns>
+          </DataGrid>
+        </DockPanel>
+      </TabItem>
     </TabControl>
     <TextBlock x:Name="Status" Grid.Row="4" Foreground="{StaticResource Mut}" Margin="2,6,0,0"/>
   </Grid>
@@ -1661,7 +2179,7 @@ function Show-PssGui($Scan, [string]$Snapshot) {
 '@
     $win = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
     $ui = @{}
-    foreach ($n in 'SubTitle', 'Tiles', 'Search', 'SearchHint', 'Cat', 'HideMs', 'FlagOnly', 'BtnExport', 'BtnRescan', 'Banner', 'Grid', 'Detail', 'BtnLoc', 'BtnFile', 'BtnVt', 'BtnWeb', 'BtnCopy', 'BootGrid', 'DelayGrid', 'Status') { $ui[$n] = $win.FindName($n) }
+    foreach ($n in 'SubTitle', 'Tiles', 'Search', 'SearchHint', 'Cat', 'HideMs', 'FlagOnly', 'BtnExport', 'BtnRescan', 'Banner', 'Grid', 'Detail', 'BtnLoc', 'BtnFile', 'BtnVt', 'BtnWeb', 'BtnCopy', 'BtnToggle', 'BtnDelete', 'BootGrid', 'DelayGrid', 'Tabs', 'UndoTab', 'UndoNote', 'UndoGrid', 'BtnUndoSel', 'BtnUndoFolder', 'BtnUndoRefresh', 'Status') { $ui[$n] = $win.FindName($n) }
     $state = @{ Scan = $Scan; Job = $null }
 
     $bc = New-Object Windows.Media.BrushConverter
@@ -1716,7 +2234,20 @@ function Show-PssGui($Scan, [string]$Snapshot) {
     }
 
     $sel = { $ui.Grid.SelectedItem }
-    $ui.Grid.Add_SelectionChanged({ $it = & $sel; $ui.Detail.Text = $(if ($it) { Get-PssDetailText $it } else { '' }) })
+    $updateButtons = {
+        $it = & $sel
+        if (-not $it) { $ui.BtnToggle.IsEnabled = $false; $ui.BtnDelete.IsEnabled = $false; $ui.BtnToggle.ToolTip = $null; $ui.BtnDelete.ToolTip = $null; return }
+        $ui.BtnToggle.Content = $(if ($it.Enabled -or -not $it.CanDisable) { 'Disable' } else { 'Enable' })
+        $ui.BtnToggle.IsEnabled = [bool]$it.CanDisable
+        $ui.BtnDelete.IsEnabled = [bool]$it.CanDelete
+        $ui.BtnToggle.ToolTip = $(if ($it.CanDisable) { 'Stop it starting automatically. It stays installed and can be enabled again.' } elseif ($it.ActionNote) { $it.ActionNote } elseif ($it.CanDelete) { "This kind of entry can't be disabled, only deleted." } else { $null })
+        $ui.BtnDelete.ToolTip = $(if ($it.CanDelete) { "Remove the startup entry (not the program). It's backed up first so you can undo it." } elseif ($it.ActionNote) { $it.ActionNote } else { "This entry can't be deleted here." })
+    }
+    $ui.Grid.Add_SelectionChanged({
+            $it = & $sel
+            $ui.Detail.Text = $(if ($it) { Get-PssDetailText $it } else { '' })
+            & $updateButtons
+        })
     $ui.Search.Add_TextChanged({
             $ui.SearchHint.Visibility = $(if ($ui.Search.Text) { 'Collapsed' } else { 'Visible' })
             & $applyFilter
@@ -1740,6 +2271,43 @@ function Show-PssGui($Scan, [string]$Snapshot) {
             }
         })
 
+    $loadUndo = {
+        $recs = @(Get-PssUndoRecords)
+        $ui.UndoGrid.ItemsSource = $recs
+        $ui.UndoTab.Header = $(if ($recs.Count) { "Undo changes ($($recs.Count))" } else { 'Undo changes' })
+        $ui.UndoNote.Text = "Every Disable, Enable and Delete made with PAX Startup Scanner on this PC is backed up in $(Get-PssBackupPath). Pick one and choose Undo to put it back the way it was."
+        $ui.BtnUndoSel.IsEnabled = $false
+    }
+    $doChange = {
+        param([string]$Action)
+        $it = & $sel; if (-not $it) { return }
+        $icon = if ($Action -eq 'Delete') { 'Warning' } else { 'Question' }
+        $answer = [Windows.MessageBox]::Show($win, (Get-PssConfirmText $it $Action), 'PAX Startup Scanner', 'YesNo', $icon)
+        if ([string]$answer -ne 'Yes') { return }
+        $res = Invoke-PssChange $it $Action
+        $ui.Status.Text = $res.Message
+        if (-not $res.Ok) { [void][Windows.MessageBox]::Show($win, $res.Message, 'PAX Startup Scanner', 'OK', 'Error') }
+        $ui.Grid.Items.Refresh()
+        $ui.Detail.Text = Get-PssDetailText $it
+        & $updateButtons
+        & $loadUndo
+    }
+    $ui.BtnToggle.Add_Click({ $it = & $sel; if ($it) { & $doChange $(if ($it.Enabled) { 'Disable' } else { 'Enable' }) } })
+    $ui.BtnDelete.Add_Click({ & $doChange 'Delete' })
+    $ui.UndoGrid.Add_SelectionChanged({ $ui.BtnUndoSel.IsEnabled = [bool]$ui.UndoGrid.SelectedItem })
+    $ui.BtnUndoRefresh.Add_Click({ & $loadUndo })
+    $ui.BtnUndoFolder.Add_Click({ $d = Get-PssBackupPath; if (Test-Path -LiteralPath $d) { Start-Process explorer.exe -ArgumentList "`"$d`"" } else { $ui.Status.Text = 'No backups yet.' } })
+    $ui.BtnUndoSel.Add_Click({
+            $r = $ui.UndoGrid.SelectedItem; if (-not $r) { return }
+            $q = "Undo this change?`n`n$($r.Action): $($r.Name)`n$($r.Category): $($r.Location)`nMade $($r.When) by $($r.RunBy)"
+            if ([string][Windows.MessageBox]::Show($win, $q, 'PAX Startup Scanner', 'YesNo', 'Question') -ne 'Yes') { return }
+            $res = Invoke-PssUndo $r
+            $ui.Status.Text = $res.Message
+            if (-not $res.Ok) { [void][Windows.MessageBox]::Show($win, $res.Message, 'PAX Startup Scanner', 'OK', 'Error') }
+            & $loadUndo
+            if ($res.Ok -and -not $state.Job) { & $startRescan }
+        })
+
     $timer = New-Object Windows.Threading.DispatcherTimer
     $timer.Interval = [TimeSpan]::FromMilliseconds(120)
     $timer.Add_Tick({
@@ -1753,22 +2321,24 @@ function Show-PssGui($Scan, [string]$Snapshot) {
                 & $load
             }
         })
-    $ui.BtnRescan.Add_Click({
-            $ui.BtnRescan.IsEnabled = $false; $win.Cursor = [Windows.Input.Cursors]::AppStarting
-            $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
-            foreach ($f in (Get-ChildItem function: | Where-Object { $_.Name -like '*-Pss*' })) {
-                $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry $f.Name, $f.Definition))
-            }
-            $sync = [hashtable]::Synchronized(@{ Stage = 'Starting...'; Pct = 0 })
-            $rs = [runspacefactory]::CreateRunspace($iss); $rs.Open()
-            $rs.SessionStateProxy.SetVariable('PssVersion', $script:PssVersion)
-            $ps = [powershell]::Create(); $ps.Runspace = $rs
-            [void]$ps.AddScript('param($s) Invoke-PssScan -Status $s').AddArgument($sync)
-            $state.Job = @{ PS = $ps; RS = $rs; Sync = $sync; Handle = $ps.BeginInvoke() }
-            $timer.Start()
-        })
+    $startRescan = {
+        $ui.BtnRescan.IsEnabled = $false; $win.Cursor = [Windows.Input.Cursors]::AppStarting
+        $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+        foreach ($f in (Get-ChildItem function: | Where-Object { $_.Name -like '*-Pss*' })) {
+            $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry $f.Name, $f.Definition))
+        }
+        $sync = [hashtable]::Synchronized(@{ Stage = 'Starting...'; Pct = 0 })
+        $rs = [runspacefactory]::CreateRunspace($iss); $rs.Open()
+        $rs.SessionStateProxy.SetVariable('PssVersion', $script:PssVersion)
+        $ps = [powershell]::Create(); $ps.Runspace = $rs
+        [void]$ps.AddScript('param($s) Invoke-PssScan -Status $s').AddArgument($sync)
+        $state.Job = @{ PS = $ps; RS = $rs; Sync = $sync; Handle = $ps.BeginInvoke() }
+        $timer.Start()
+    }
+    $ui.BtnRescan.Add_Click({ & $startRescan })
 
     & $load
+    & $loadUndo
     if ($Snapshot) {
         # Lay the window content out without ever showing a window, then save it as a PNG
         $root = $win.Content; $win.Content = $null
@@ -1782,6 +2352,11 @@ function Show-PssGui($Scan, [string]$Snapshot) {
         $size = New-Object Windows.Size 1280, 800
         $wrap.Measure($size); $wrap.Arrange((New-Object Windows.Rect $size)); $wrap.UpdateLayout()
         if ($ui.Grid.Items.Count) { $ui.Grid.SelectedIndex = 0; $wrap.UpdateLayout() }
+        if ($SnapshotTab) {
+            $ui.Tabs.SelectedIndex = $SnapshotTab
+            if ($ui.UndoGrid.Items.Count) { $ui.UndoGrid.SelectedIndex = 0 }
+            $wrap.Measure($size); $wrap.Arrange((New-Object Windows.Rect $size)); $wrap.UpdateLayout()
+        }
         $bmp = New-Object Windows.Media.Imaging.RenderTargetBitmap 1280, 800, 96, 96, ([Windows.Media.PixelFormats]::Pbgra32)
         $bmp.Render($wrap)
         $enc = New-Object Windows.Media.Imaging.PngBitmapEncoder
