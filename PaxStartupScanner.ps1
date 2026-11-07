@@ -36,7 +36,7 @@ param(
     [switch]$ReadOnly
 )
 
-$script:PssVersion = '1.2.1'
+$script:PssVersion = '1.3.0'
 $script:PssUrl     = 'https://raw.githubusercontent.com/joshpack/PaxStartupScanner/main/PaxStartupScanner.ps1'
 $script:PssSelfPath = $PSCommandPath   # empty when run through irm | iex
 
@@ -1537,6 +1537,140 @@ function Get-PssUndoRecords {
     return $out
 }
 
+function Invoke-PssStep($s) {
+    # Puts one saved piece of state back (used by Undo and by full-backup restore)
+    switch ($s.T) {
+        'RegValue' { Restore-PssRegValue $s }
+        'File' {
+            if (Test-Path -LiteralPath $s.To) { throw "A file already exists at $($s.To)." }
+            if (-not (Test-Path -LiteralPath $s.From)) { throw "The backup file is missing: $($s.From)" }
+            $parent = Split-Path -Parent $s.To
+            if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null }
+            Move-Item -LiteralPath $s.From -Destination $s.To -ErrorAction Stop
+        }
+        'FileContent' {
+            # full backups carry the file itself; it is only written when missing or different
+            $same = $false
+            if (Test-Path -LiteralPath $s.Path) { $same = [Convert]::ToBase64String([IO.File]::ReadAllBytes($s.Path)) -eq [string]$s.Data }
+            if (-not $same) {
+                $parent = Split-Path -Parent $s.Path
+                if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null }
+                [IO.File]::WriteAllBytes($s.Path, [Convert]::FromBase64String([string]$s.Data))
+            }
+        }
+        'Task' {
+            $i = $s.Path.LastIndexOf('\')
+            $folder = if ($i -le 0) { '\' } else { $s.Path.Substring(0, $i) + '\' }
+            Register-ScheduledTask -Xml ([string]$s.Xml) -TaskName $s.Path.Substring($i + 1) -TaskPath $folder -Force -ErrorAction Stop | Out-Null
+        }
+        'TaskEnabled' { $t = Get-PssTask $s.Path; $t.Task.Enabled = [bool]$s.Enabled }
+        'Service' { Set-PssServiceStart $s.Name $s.Start }
+        'RegImport' {
+            $out = & reg.exe import $s.File /reg:64 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "reg import failed: $((($out | Out-String) -replace '\s+', ' ').Trim())" }
+        }
+        'RegText' {
+            # a .reg export carried inside a full backup
+            $tmp = Join-Path $env:TEMP ('pss-restore-' + [guid]::NewGuid().ToString('N') + '.reg')
+            try {
+                [IO.File]::WriteAllText($tmp, [string]$s.Text, [Text.Encoding]::Unicode)
+                $out = & reg.exe import $tmp /reg:64 2>&1
+                if ($LASTEXITCODE -ne 0) { throw "reg import failed: $((($out | Out-String) -replace '\s+', ' ').Trim())" }
+            } finally { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
+        }
+        default { throw "Unknown backup step '$($s.T)'." }
+    }
+}
+
+function Get-PssSnapshotSteps($it) {
+    # The current state of one entry, captured without changing anything
+    $op = $it.Op
+    $steps = New-Object System.Collections.Generic.List[object]
+    $addValue = {
+        param([string]$Path, [string]$Name)
+        $k = Open-PssKey $Path
+        if ($k) { try { $steps.Add((Backup-PssRegValue $k $Path $Name)) } finally { $k.Close() } }
+        else { $steps.Add(@{ T = 'RegValue'; Key = $Path; Name = $Name; Existed = $false; Kind = ''; Data = $null }) }
+    }
+    switch ($op.Type) {
+        'RegValue' {
+            & $addValue $op.Key $op.Name
+            if ($op.ApprovedKind) { & $addValue "$($op.ApprovedRoot)\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\$($op.ApprovedKind)" $op.Name }
+        }
+        'File' {
+            if (Test-Path -LiteralPath $op.Path) { $steps.Add(@{ T = 'FileContent'; Path = $op.Path; Data = [Convert]::ToBase64String([IO.File]::ReadAllBytes($op.Path)) }) }
+            if ($op.ApprovedRoot) { & $addValue "$($op.ApprovedRoot)\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder" $op.ApprovedName }
+        }
+        'Task' {
+            $t = Get-PssTask $op.Path
+            $steps.Add(@{ T = 'Task'; Path = $op.Path; Xml = [string]$t.Task.Xml })
+            $steps.Add(@{ T = 'TaskEnabled'; Path = $op.Path; Enabled = [bool]$t.Task.Enabled })
+        }
+        'Service' { $steps.Add(@{ T = 'Service'; Name = $op.Name; Start = $(if ($it.Enabled) { $op.Start } else { 'disabled' }) }) }
+        'StoreApp' { & $addValue $op.Key 'State' }
+        'ListPart' { & $addValue $op.Key $op.Name }
+        'RegKey' {
+            $tmp = Join-Path $env:TEMP ('pss-export-' + [guid]::NewGuid().ToString('N') + '.reg')
+            try {
+                $null = & reg.exe export $op.Key $tmp /y /reg:64 2>&1
+                if ($LASTEXITCODE -eq 0) { $steps.Add(@{ T = 'RegText'; Key = $op.Key; Text = [IO.File]::ReadAllText($tmp) }) }
+            } finally { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
+        }
+    }
+    return , $steps.ToArray()
+}
+
+function New-PssSnapshot($Scan) {
+    # Full backup of every entry the scanner could change, as JSON text. Protected Windows parts
+    # are left out: they can't be changed here, so there is nothing to restore.
+    $ro = $script:PssReadOnly; $script:PssReadOnly = $false
+    $entries = New-Object System.Collections.Generic.List[object]
+    $skipped = 0
+    try {
+        Initialize-PssRegistry
+        foreach ($it in $Scan.Items) {
+            if ($it.State -eq 'Removed' -or -not $it.Op -or $it.Op.Type -in 'Blocked', 'Wmi') { continue }
+            $keep = @($it.CanDisable, $it.CanDelete, $it.ActionNote)
+            Set-PssPermissions $it
+            $changeable = $it.CanDisable -or $it.CanDelete
+            $it.CanDisable = $keep[0]; $it.CanDelete = $keep[1]; $it.ActionNote = $keep[2]
+            if (-not $changeable) { continue }
+            try {
+                $steps = Get-PssSnapshotSteps $it
+                if ($steps.Count) { $entries.Add([pscustomobject][ordered]@{ Category = $it.Category; Name = $it.Name; Location = $it.Location; Command = $it.Command; Enabled = [bool]$it.Enabled; Steps = $steps }) }
+            } catch { $skipped++ }
+        }
+    } finally { $script:PssReadOnly = $ro }
+    $snap = [pscustomobject][ordered]@{
+        Format = 'PaxStartupScanner.Backup'; Version = 1; Computer = $env:COMPUTERNAME; Time = (Get-Date).ToString('o')
+        RunBy = "$env:USERDOMAIN\$env:USERNAME"; ScannerVersion = $script:PssVersion; Count = $entries.Count; Skipped = $skipped
+        Items = $entries.ToArray()
+    }
+    return ($snap | ConvertTo-Json -Depth 8)
+}
+
+function Read-PssSnapshot([string]$Json) {
+    $s = $null
+    try { $s = $Json | ConvertFrom-Json } catch {}
+    if (-not $s -or $s.Format -ne 'PaxStartupScanner.Backup') { throw "That isn't a PAX Startup Scanner backup." }
+    return $s
+}
+
+function Restore-PssSnapshot($Snap) {
+    # Puts every entry in a full backup back the way it was. Returns @{ Ok; Message; Failed }
+    if ($script:PssReadOnly) { return @{ Ok = $false; Message = 'Read-only mode: nothing on this PC is changed.'; Failed = @() } }
+    Initialize-PssRegistry
+    $failed = @(); $done = 0
+    foreach ($e in @($Snap.Items)) {
+        try { foreach ($s in @($e.Steps)) { Invoke-PssStep $s }; $done++ }
+        catch { $failed += ('{0} ({1}): {2}' -f $e.Name, $e.Category, (Format-PssError $_)) }
+    }
+    $when = ''; try { $when = ([datetime]::Parse([string]$Snap.Time)).ToString('yyyy-MM-dd HH:mm') } catch {}
+    $msg = "Restored $done of $(@($Snap.Items).Count) startup entries from the backup of $($Snap.Computer) taken $when."
+    if ($failed) { $msg += " $($failed.Count) could not be restored." }
+    return @{ Ok = (-not $failed); Message = $msg; Failed = $failed }
+}
+
 function Invoke-PssUndo($Rec) {
     # Replays the record's backup steps in reverse, then files the record under Backups\Restored
     if ($script:PssReadOnly) { return @{ Ok = $false; Message = 'Read-only mode: nothing on this PC is changed.' } }
@@ -1545,29 +1679,8 @@ function Invoke-PssUndo($Rec) {
     try {
         Initialize-PssRegistry
         foreach ($s in $steps) {
-            switch ($s.T) {
-                'RegValue' { Restore-PssRegValue $s }
-                'File' {
-                    if (Test-Path -LiteralPath $s.To) { throw "A file already exists at $($s.To)." }
-                    if (-not (Test-Path -LiteralPath $s.From)) { throw "The backup file is missing: $($s.From)" }
-                    $parent = Split-Path -Parent $s.To
-                    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null }
-                    Move-Item -LiteralPath $s.From -Destination $s.To -ErrorAction Stop
-                }
-                'Task' {
-                    $i = $s.Path.LastIndexOf('\')
-                    $folder = if ($i -le 0) { '\' } else { $s.Path.Substring(0, $i) + '\' }
-                    Register-ScheduledTask -Xml ([string]$s.Xml) -TaskName $s.Path.Substring($i + 1) -TaskPath $folder -Force -ErrorAction Stop | Out-Null
-                }
-                'TaskEnabled' { $t = Get-PssTask $s.Path; $t.Task.Enabled = [bool]$s.Enabled }
-                'Service' { Set-PssServiceStart $s.Name $s.Start }
-                'RegImport' {
-                    $out = & reg.exe import $s.File /reg:64 2>&1
-                    if ($LASTEXITCODE -ne 0) { throw "reg import failed: $((($out | Out-String) -replace '\s+', ' ').Trim())" }
-                }
-                'Wmi' { throw "WMI subscriptions aren't restored automatically. The removed definition is saved in $($Rec.File)." }
-                default { throw "Unknown backup step '$($s.T)'." }
-            }
+            if ($s.T -eq 'Wmi') { throw "WMI subscriptions aren't restored automatically. The removed definition is saved in $($Rec.File)." }
+            Invoke-PssStep $s
         }
     } catch { return @{ Ok = $false; Message = (Format-PssError $_) } }
     try {
@@ -2295,6 +2408,74 @@ function Invoke-PssConsoleScan {
     return $scan
 }
 
+function Confirm-PssRestoreText($Snap) {
+    # Summary + warnings shown before a full restore (console and GUI)
+    $when = ''; try { $when = ([datetime]::Parse([string]$Snap.Time)).ToString('yyyy-MM-dd HH:mm') } catch {}
+    $t = "Restore $(@($Snap.Items).Count) startup entries from the backup of $($Snap.Computer) taken $when by $($Snap.RunBy)?`n`n"
+    $t += "Entries that were deleted come back, and disabled or enabled entries go back to how they were then. Entries added since the backup are not touched.`n"
+    if ($Snap.Computer -ne $env:COMPUTERNAME) { $t += "`nWARNING: this backup is from a different PC ($($Snap.Computer)), not $($env:COMPUTERNAME).`n" }
+    return $t
+}
+
+function Show-PssBackupMenu($Scan) {
+    # Full backup of the startup settings: save to a file or the clipboard (handy over remote sessions), and restore.
+    # Returns $true when something was restored, so the caller can rescan.
+    while ($true) {
+        Write-PssHeader $Scan
+        Write-PssRule 'Full backup of startup settings'
+        Write-Host '   Takes a copy of every startup entry the scanner can change (Run keys, startup folders, tasks,' -ForegroundColor Gray
+        Write-Host '   services, Store apps and the rest) so you can put them all back later. Each single change is also' -ForegroundColor Gray
+        Write-Host '   backed up automatically ([U] Undo); this is the "everything as it is now" copy before you start.' -ForegroundColor Gray
+        Write-Host '   Over a remote session, copy it to the clipboard and paste it into a text file on your own PC.' -ForegroundColor DarkGray
+        Write-Host ''
+        Write-Host '   [1] Save a backup to a file   [2] Copy a backup to the clipboard' -ForegroundColor Cyan
+        Write-Host '   [3] Restore from a file       [4] Restore from the clipboard       [Enter] Back' -ForegroundColor Cyan
+        Write-Host '   > ' -NoNewline -ForegroundColor Cyan
+        $k = Read-PssKey
+        switch -Regex ($k) {
+            '^[12]$' {
+                if ($k -eq '1' -and $script:PssReadOnly) { Write-Host '   Read-only mode: no files are written. Use [2] to copy it to the clipboard instead.' -ForegroundColor Yellow; Start-Sleep 2; break }
+                Write-Host '   Collecting the current startup settings...' -ForegroundColor DarkGray
+                $json = New-PssSnapshot $Scan
+                $n = ($json | ConvertFrom-Json).Count
+                if ($k -eq '1') {
+                    $def = Join-Path ([Environment]::GetFolderPath('Desktop')) ('PAX-Startup-Backup-{0}-{1:yyyyMMdd-HHmm}.json' -f $env:COMPUTERNAME, (Get-Date))
+                    Write-Host "   Save as [$def] > " -NoNewline -ForegroundColor Cyan
+                    $p = Read-PssKey; if (-not $p) { $p = $def }
+                    try { [IO.File]::WriteAllText($p, $json, (New-Object Text.UTF8Encoding $false)); Write-Host ("   Saved {0} entries ({1:N0} KB) to {2}" -f $n, ($json.Length / 1KB), $p) -ForegroundColor Green }
+                    catch { Write-Host "   Could not save: $($_.Exception.Message)" -ForegroundColor Red }
+                } else {
+                    try { Set-Clipboard -Value $json; Write-Host ("   Copied {0} entries ({1:N0} KB of text) to the clipboard. Paste it into a text file and save it as .json." -f $n, ($json.Length / 1KB)) -ForegroundColor Green }
+                    catch { Write-Host "   Could not use the clipboard: $($_.Exception.Message)" -ForegroundColor Red }
+                }
+                Write-Host '   Press Enter to continue > ' -NoNewline -ForegroundColor Cyan; $null = Read-PssKey
+                break
+            }
+            '^[34]$' {
+                try {
+                    if ($k -eq '3') {
+                        Write-Host '   Path of the backup file > ' -NoNewline -ForegroundColor Cyan
+                        $p = (Read-PssKey).Trim('"')
+                        if (-not $p) { break }
+                        $snap = Read-PssSnapshot ([IO.File]::ReadAllText($p))
+                    } else { $snap = Read-PssSnapshot ((Get-Clipboard -Raw) | Out-String) }
+                } catch { Write-Host "   $($_.Exception.Message)" -ForegroundColor Red; Start-Sleep 2; break }
+                Write-Host ''
+                foreach ($l in ((Confirm-PssRestoreText $snap) -split "`n")) { Write-Host "   $l" -ForegroundColor $(if ($l -like 'WARNING*') { 'Red' } else { 'Yellow' }) }
+                Write-Host '   Type Y to restore > ' -NoNewline -ForegroundColor Cyan
+                if ((Read-PssKey) -notmatch '^(?i)y(es)?$') { break }
+                $r = Restore-PssSnapshot $snap
+                Write-Host "   $($r.Message)" -ForegroundColor $(if ($r.Ok) { 'Green' } else { 'Yellow' })
+                foreach ($f in $r.Failed) { Write-Host "     $f" -ForegroundColor Red }
+                Write-Host '   Press Enter to rescan > ' -NoNewline -ForegroundColor Cyan; $null = Read-PssKey
+                if ($r.Message -notlike 'Read-only*') { return $true }
+                break
+            }
+            default { return $false }
+        }
+    }
+}
+
 function Show-PssUndo($Scan) {
     # Lists saved changes; returns $true when something was restored (so the caller can rescan)
     $restored = $false
@@ -2350,10 +2531,12 @@ function Start-PssConsole($Scan) {
             @('4', "Browse by category ($nCat)"), @('E', 'Export report (HTML/CSV/JSON)'),
             @('A', $(if ($script:PssOnlyEnabled) { 'Show items that are on AND off' } else { 'Show only items that are on' })), @('G', 'Open GUI view'),
             @('M', $(if ($script:PssShowMicrosoft) { 'Browse/search: hide Microsoft' } else { 'Browse/search: show Microsoft' })), @('R', 'Rescan'),
-            @('U', "Undo a change ($(@(Get-PssUndoRecords).Count) saved)"), @('Q', 'Quit')
+            @('B', 'Back up / restore all startup settings'), @('U', "Undo a change ($(@(Get-PssUndoRecords).Count) saved)"),
+            @('Q', 'Quit'), @('', '')
         )
         for ($i = 0; $i -lt $menu.Count; $i += 2) {
             foreach ($m in $menu[$i], $menu[$i + 1]) {
+                if (-not $m[0]) { continue }
                 Write-Host ('   [' ) -NoNewline -ForegroundColor DarkGray
                 Write-Host $m[0] -NoNewline -ForegroundColor Cyan
                 Write-Host ('] ' + $m[1].PadRight(36)) -NoNewline -ForegroundColor Gray
@@ -2388,6 +2571,7 @@ function Start-PssConsole($Scan) {
             '^(?i)m$' { $script:PssShowMicrosoft = -not $script:PssShowMicrosoft ; break }
             '^(?i)r$' { Write-PssHeader $null; $Scan = Invoke-PssConsoleScan ; break }
             '^(?i)u$' { if (Show-PssUndo $Scan) { Write-PssHeader $null; $Scan = Invoke-PssConsoleScan }; break }
+            '^(?i)b$' { if (Show-PssBackupMenu $Scan) { Write-PssHeader $null; $Scan = Invoke-PssConsoleScan }; break }
             '^(?i)(q|quit|exit)$' { Write-Host ''; return }
             '^\d+$' { Show-PssDetails $Scan ([int]$k) }
         }
@@ -2534,6 +2718,7 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
       <Button x:Name="BtnClear" DockPanel.Dock="Left" ToolTip="Show everything again (keeps the Microsoft switch)">Clear filters</Button>
       <Button x:Name="BtnExport" DockPanel.Dock="Right" Margin="0">Export report</Button>
       <Button x:Name="BtnRescan" DockPanel.Dock="Right">Rescan</Button>
+      <Button x:Name="BtnBackup" DockPanel.Dock="Right" ToolTip="Save or restore a full copy of the startup settings">Backup</Button>
     </DockPanel>
     <TextBlock x:Name="Banner" Grid.Row="2" Foreground="#FBBF24" Margin="0,0,0,6" TextWrapping="Wrap" Visibility="Collapsed"/>
     <TabControl x:Name="Tabs" Grid.Row="3" Background="Transparent" BorderThickness="0" Padding="0">
@@ -2663,7 +2848,7 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
 '@
     $win = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
     $ui = @{}
-    foreach ($n in 'SubTitle', 'Tiles', 'Search', 'SearchHint', 'HideMs', 'BtnClear', 'Facets', 'BootTestTab', 'BtLabel', 'BtnBtArm', 'BtnBtCancel', 'BtnBtRestart', 'BtState', 'BtnBtRefresh', 'BtGrid', 'BtnBtCompare', 'BtCompare', 'BtnExport','BtnRescan', 'Banner', 'Grid', 'Detail', 'BtnLoc', 'BtnFile', 'BtnVt', 'BtnWeb', 'BtnCopy', 'BtnToggle', 'BtnDelete', 'BootGrid', 'DelayGrid', 'Tabs', 'UndoTab', 'UndoNote', 'UndoGrid', 'BtnUndoSel', 'BtnUndoFolder', 'BtnUndoRefresh', 'Status') { $ui[$n] = $win.FindName($n) }
+    foreach ($n in 'SubTitle', 'Tiles', 'Search', 'SearchHint', 'HideMs', 'BtnClear', 'Facets', 'BootTestTab', 'BtLabel', 'BtnBtArm', 'BtnBtCancel', 'BtnBtRestart', 'BtState', 'BtnBtRefresh', 'BtGrid', 'BtnBtCompare', 'BtCompare', 'BtnExport', 'BtnBackup', 'BtnRescan', 'Banner', 'Grid', 'Detail', 'BtnLoc', 'BtnFile', 'BtnVt', 'BtnWeb', 'BtnCopy', 'BtnToggle', 'BtnDelete', 'BootGrid', 'DelayGrid', 'Tabs', 'UndoTab', 'UndoNote', 'UndoGrid', 'BtnUndoSel', 'BtnUndoFolder', 'BtnUndoRefresh', 'Status') { $ui[$n] = $win.FindName($n) }
     $state = @{ Scan = $Scan; Job = $null }
 
     $bc = New-Object Windows.Media.BrushConverter
@@ -2900,6 +3085,61 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
             $b = New-Object Windows.Controls.MenuItem; $b.Header = "Only the $($ui.Grid.Items.Count) items shown now..."; $b.Add_Click({ & $exportTo $true })
             [void]$m.Items.Add($a); [void]$m.Items.Add($b)
             $m.PlacementTarget = $ui.BtnExport; $m.Placement = 'Bottom'; $m.IsOpen = $true
+        })
+
+    # ---- full backup of the startup settings: file or clipboard (for remote sessions), and restore ----
+    $backupTo = {
+        param([bool]$Clipboard)
+        if (-not $Clipboard -and $script:PssReadOnly) { $ui.Status.Text = 'Read-only mode: no files are written. Use "Copy a backup to the clipboard" instead.'; return }
+        $win.Cursor = [Windows.Input.Cursors]::Wait
+        try { $json = New-PssSnapshot $state.Scan } finally { $win.Cursor = $null }
+        $n = ($json | ConvertFrom-Json).Count
+        if ($Clipboard) {
+            [Windows.Clipboard]::SetText($json)
+            $ui.Status.Text = "Copied a backup of $n startup entries ({0:N0} KB of text) to the clipboard. Paste it into a text file on your PC and save it as .json." -f ($json.Length / 1KB)
+            return
+        }
+        $d = New-Object Microsoft.Win32.SaveFileDialog
+        $d.Filter = 'PAX Startup Scanner backup|*.json'
+        $d.FileName = 'PAX-Startup-Backup-{0}-{1:yyyyMMdd-HHmm}' -f $env:COMPUTERNAME, (Get-Date)
+        if (-not $d.ShowDialog($win)) { return }
+        try { [IO.File]::WriteAllText($d.FileName, $json, (New-Object Text.UTF8Encoding $false)); $ui.Status.Text = "Saved a backup of $n startup entries to $($d.FileName)" }
+        catch { [void][Windows.MessageBox]::Show($win, "Could not save: $($_.Exception.Message)", 'PAX Startup Scanner', 'OK', 'Error') }
+    }
+    $restoreFrom = {
+        param([bool]$Clipboard)
+        try {
+            if ($Clipboard) { $snap = Read-PssSnapshot ([Windows.Clipboard]::GetText()) }
+            else {
+                $d = New-Object Microsoft.Win32.OpenFileDialog
+                $d.Filter = 'PAX Startup Scanner backup|*.json|All files|*.*'
+                if (-not $d.ShowDialog($win)) { return }
+                $snap = Read-PssSnapshot ([IO.File]::ReadAllText($d.FileName))
+            }
+        } catch { [void][Windows.MessageBox]::Show($win, $_.Exception.Message, 'PAX Startup Scanner', 'OK', 'Error'); return }
+        $icon = if ($snap.Computer -ne $env:COMPUTERNAME) { 'Warning' } else { 'Question' }
+        if ([string][Windows.MessageBox]::Show($win, (Confirm-PssRestoreText $snap), 'PAX Startup Scanner', 'YesNo', $icon) -ne 'Yes') { return }
+        $win.Cursor = [Windows.Input.Cursors]::Wait
+        try { $r = Restore-PssSnapshot $snap } finally { $win.Cursor = $null }
+        $ui.Status.Text = $r.Message
+        if ($r.Failed) { [void][Windows.MessageBox]::Show($win, ($r.Message + "`n`n" + ($r.Failed -join "`n")), 'PAX Startup Scanner', 'OK', 'Warning') }
+        elseif (-not $r.Ok) { [void][Windows.MessageBox]::Show($win, $r.Message, 'PAX Startup Scanner', 'OK', 'Error') }
+        if ($r.Message -notlike 'Read-only*' -and -not $state.Job) { & $startRescan }
+    }
+    $ui.BtnBackup.Add_Click({
+            $m = New-Object Windows.Controls.ContextMenu
+            $items = @(
+                @('Save a backup to a file...', { & $backupTo $false }),
+                @('Copy a backup to the clipboard', { & $backupTo $true }),
+                $null,
+                @('Restore from a backup file...', { & $restoreFrom $false }),
+                @('Restore from the clipboard...', { & $restoreFrom $true })
+            )
+            foreach ($i in $items) {
+                if (-not $i) { [void]$m.Items.Add((New-Object Windows.Controls.Separator)); continue }
+                $mi = New-Object Windows.Controls.MenuItem; $mi.Header = $i[0]; $mi.Add_Click($i[1]); [void]$m.Items.Add($mi)
+            }
+            $m.PlacementTarget = $ui.BtnBackup; $m.Placement = 'Bottom'; $m.IsOpen = $true
         })
 
     $loadUndo = {

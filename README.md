@@ -70,6 +70,7 @@ The dashboard shows the risk summary, where things start from, boot times and th
 | `G` | Open the GUI with the same results |
 | `M` | Include clean Microsoft items when browsing and searching |
 | `R` | Rescan |
+| `B` | Back up or restore all startup settings (to a file or the clipboard) |
 | `U` | Undo a change made earlier (lists every saved change on this PC) |
 | any number | Show that item's details |
 
@@ -166,6 +167,19 @@ There are two ways to stop something starting. **Disable** happens straight away
 - **Registry keys:** the key, after a `.reg` export.
 - **WMI subscriptions:** the consumer, its binding and its filter.
 - **Shared values** (`Userinit`, `AppInit_DLLs`, `BootExecute`, LSA packages): only that item's part is removed. An emptied `Shell` or `Userinit` gets the Windows default back.
+
+**Full backup before you start.** **Backup** in the GUI, or `B` in the console, takes a copy of every startup entry the scanner can change:
+- Run-key values and their Task Manager on/off flags
+- startup-folder files
+- scheduled-task definitions
+- service start types
+- Store-app startup states, and the rest
+
+You can keep it in two ways:
+- **Save it to a file:** one JSON file, about 200 KB on a typical PC.
+- **Copy it to the clipboard:** when you're working over remote desktop or another remote tool, paste it into a text file on your own PC and keep it there.
+
+**Restore from a file** or **Restore from the clipboard** puts everything back the way it was when the backup was taken. Entries added since are left alone. You get a warning if the backup came from a different PC. In read-only mode you can still copy a backup to the clipboard, but saving and restoring are off. Protected Windows parts and WMI subscriptions aren't included, since the scanner never changes them.
 
 **Backups and Undo.** Before anything is changed, a record of the old state is written to `C:\ProgramData\PaxStartupScanner\Backups`. If the change fails, the record is removed again. **Undo** (`U` in the console, the **Undo changes** tab in the GUI) lists every change made on that PC and puts it back. Restored records move to `Backups\Restored`. Two exceptions:
 - **WMI subscriptions** aren't recreated automatically. Their definition is saved for reference.
