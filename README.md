@@ -1,4 +1,4 @@
-# PAX Startup Scanner
+# <img src="docs/icon.png" width="44" align="top" alt=""> PAX Startup Scanner
 
 Finds everything that starts with Windows: what each item is, where it lives, who signed it, whether it looks suspicious, and what is slowing the machine down. You can filter the results by status, risk, category, publisher, signature and more. You can disable or delete what shouldn't be there, and every change is backed up and can be undone. You can also time a restart before and after your changes to see whether they helped.
 

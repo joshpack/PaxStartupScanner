@@ -36,7 +36,7 @@ param(
     [switch]$ReadOnly
 )
 
-$script:PssVersion = '1.3.0'
+$script:PssVersion = '1.3.1'
 $script:PssUrl     = 'https://raw.githubusercontent.com/joshpack/PaxStartupScanner/main/PaxStartupScanner.ps1'
 $script:PssSelfPath = $PSCommandPath   # empty when run through irm | iex
 
@@ -2582,6 +2582,46 @@ function Start-PssConsole($Scan) {
 #  GUI (WPF)
 # ======================================================================================
 
+function New-PssIcon([int]$Size = 256) {
+    # The app icon, drawn in code because the scanner ships as one file:
+    # blue tile, white power symbol (startup), amber magnifier (scanner)
+    $dv = New-Object Windows.Media.DrawingVisual
+    $dc = $dv.RenderOpen()
+    $s = $Size / 256.0
+    $grad = New-Object Windows.Media.LinearGradientBrush ([Windows.Media.Color]::FromRgb(0x25, 0x63, 0xEB)), ([Windows.Media.Color]::FromRgb(0x1E, 0x2A, 0x5A)), 45
+    $dc.DrawRoundedRectangle($grad, $null, (New-Object Windows.Rect (8 * $s), (8 * $s), (240 * $s), (240 * $s)), (52 * $s), (52 * $s))
+    $white = New-Object Windows.Media.Pen ([Windows.Media.Brushes]::White), (20 * $s)
+    $white.StartLineCap = 'Round'; $white.EndLineCap = 'Round'
+    $cx = 112 * $s; $cy = 120 * $s; $r = 58 * $s
+    $a1 = -55 * [math]::PI / 180; $a2 = 235 * [math]::PI / 180
+    $fig = New-Object Windows.Media.PathFigure
+    $fig.StartPoint = New-Object Windows.Point ($cx + $r * [math]::Cos($a1)), ($cy + $r * [math]::Sin($a1))
+    $arc = New-Object Windows.Media.ArcSegment
+    $arc.Point = New-Object Windows.Point ($cx + $r * [math]::Cos($a2)), ($cy + $r * [math]::Sin($a2))
+    $arc.Size = New-Object Windows.Size $r, $r; $arc.IsLargeArc = $true; $arc.SweepDirection = 'Clockwise'
+    $fig.Segments.Add($arc)
+    $geo = New-Object Windows.Media.PathGeometry; $geo.Figures.Add($fig)
+    $dc.DrawGeometry($null, $white, $geo)
+    $dc.DrawLine($white, (New-Object Windows.Point $cx, (48 * $s)), (New-Object Windows.Point $cx, (118 * $s)))
+    $lensPen = New-Object Windows.Media.Pen (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Color]::FromRgb(0xFB, 0xBF, 0x24))), (16 * $s)
+    $lensPen.StartLineCap = 'Round'; $lensPen.EndLineCap = 'Round'
+    $dc.DrawEllipse((New-Object Windows.Media.SolidColorBrush ([Windows.Media.Color]::FromArgb(0x55, 0x1E, 0x2A, 0x5A))), $lensPen, (New-Object Windows.Point (182 * $s), (180 * $s)), (30 * $s), (30 * $s))
+    $dc.DrawLine($lensPen, (New-Object Windows.Point (204 * $s), (202 * $s)), (New-Object Windows.Point (228 * $s), (226 * $s)))
+    $dc.Close()
+    $bmp = New-Object Windows.Media.Imaging.RenderTargetBitmap $Size, $Size, 96, 96, ([Windows.Media.PixelFormats]::Pbgra32)
+    $bmp.Render($dv); $bmp.Freeze()
+    return $bmp
+}
+
+function Set-PssAppId {
+    # Give the process its own taskbar identity; otherwise Windows groups the window under
+    # PowerShell and shows PowerShell's icon on the taskbar
+    if (-not ('Pss.Shell' -as [type])) {
+        Add-Type -Namespace Pss -Name Shell -MemberDefinition '[System.Runtime.InteropServices.DllImport("shell32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)] public static extern int SetCurrentProcessExplicitAppUserModelID(string appId);'
+    }
+    [void][Pss.Shell]::SetCurrentProcessExplicitAppUserModelID('Pax.StartupScanner')
+}
+
 function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
     # -Snapshot <png>: render the window off-screen to an image instead of showing it (self-test, README screenshots)
     if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
@@ -2703,9 +2743,12 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
   <Grid Margin="16,12,16,8">
     <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
     <DockPanel Grid.Row="0">
-      <StackPanel DockPanel.Dock="Left">
-        <TextBlock FontSize="20" FontWeight="SemiBold">PAX Startup Scanner</TextBlock>
-        <TextBlock x:Name="SubTitle" Foreground="{StaticResource Mut}" Margin="0,2,0,0"/>
+      <StackPanel DockPanel.Dock="Left" Orientation="Horizontal">
+        <Image x:Name="TitleIcon" Width="40" Height="40" Margin="0,0,12,0" VerticalAlignment="Center"/>
+        <StackPanel VerticalAlignment="Center">
+          <TextBlock FontSize="20" FontWeight="SemiBold">PAX Startup Scanner</TextBlock>
+          <TextBlock x:Name="SubTitle" Foreground="{StaticResource Mut}" Margin="0,2,0,0"/>
+        </StackPanel>
       </StackPanel>
       <StackPanel x:Name="Tiles" Orientation="Horizontal" HorizontalAlignment="Right" DockPanel.Dock="Right"/>
     </DockPanel>
@@ -2847,6 +2890,14 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
 </Window>
 '@
     $win = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
+    # Own icon for the title bar, Alt+Tab and the taskbar (instead of PowerShell's)
+    try {
+        $icon = New-PssIcon 256
+        $win.Icon = $icon
+        $win.FindName('TitleIcon').Source = $icon
+        # (compiling the small taskbar helper writes temp files, so read-only mode skips it)
+        if (-not $Snapshot -and -not $script:PssReadOnly) { Set-PssAppId }
+    } catch {}
     $ui = @{}
     foreach ($n in 'SubTitle', 'Tiles', 'Search', 'SearchHint', 'HideMs', 'BtnClear', 'Facets', 'BootTestTab', 'BtLabel', 'BtnBtArm', 'BtnBtCancel', 'BtnBtRestart', 'BtState', 'BtnBtRefresh', 'BtGrid', 'BtnBtCompare', 'BtCompare', 'BtnExport', 'BtnBackup', 'BtnRescan', 'Banner', 'Grid', 'Detail', 'BtnLoc', 'BtnFile', 'BtnVt', 'BtnWeb', 'BtnCopy', 'BtnToggle', 'BtnDelete', 'BootGrid', 'DelayGrid', 'Tabs', 'UndoTab', 'UndoNote', 'UndoGrid', 'BtnUndoSel', 'BtnUndoFolder', 'BtnUndoRefresh', 'Status') { $ui[$n] = $win.FindName($n) }
     $state = @{ Scan = $Scan; Job = $null }

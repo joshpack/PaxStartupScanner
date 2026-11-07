@@ -11,6 +11,9 @@ $text = $text.Substring(0, $text.LastIndexOf('Start-PaxStartupScanner -Gui'))
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $OutDir = (Resolve-Path $OutDir).Path
+# The app icon for the README header (docs\icon.png)
+$enc = New-Object Windows.Media.Imaging.PngBitmapEncoder; $enc.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create((New-PssIcon 128)))
+$fs = [IO.File]::Create((Join-Path (Split-Path $OutDir -Parent) 'icon.png')); $enc.Save($fs); $fs.Close()
 
 # ---------------------------------------------------------------- sample data
 Initialize-Pss
