@@ -8,7 +8,13 @@ It is one PowerShell script with nothing to install, so you can run it straight 
 
 ## Run it
 
-Open **PowerShell as Administrator** and paste:
+Open **PowerShell as Administrator** and type:
+
+```powershell
+irm paxdigi.com/startup | iex
+```
+
+`irm` downloads the script and `iex` runs it. The short address forwards to the script on GitHub, so it always gets the latest version. The full address works too:
 
 ```powershell
 irm https://raw.githubusercontent.com/joshpack/PaxStartupScanner/main/PaxStartupScanner.ps1 | iex

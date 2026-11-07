@@ -10,7 +10,10 @@
     %ProgramData%\PaxStartupScanner\Backups first and can be undone from the Undo list.
     Run it from an elevated PowerShell prompt straight from GitHub:
 
-        irm https://raw.githubusercontent.com/joshpack/PaxStartupScanner/main/PaxStartupScanner.ps1 | iex
+        irm paxdigi.com/startup | iex
+
+    (the short address forwards to
+        https://raw.githubusercontent.com/joshpack/PaxStartupScanner/main/PaxStartupScanner.ps1)
 
     Scans: Run/RunOnce keys (machine + every loaded user), startup folders (all profiles),
     scheduled tasks, auto-start services and drivers, Winlogon, Explorer hooks, AppInit DLLs,
