@@ -1,0 +1,7 @@
+# Reports exported while testing
+*.html
+*.csv
+*.json
+
+# Local notes
+CLAUDE.md
