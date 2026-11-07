@@ -90,7 +90,7 @@ $delays = @(
 $scan = [pscustomobject]@{
     Items = $items; Errors = @(); Computer = 'WORKSTATION-07'; OS = 'Windows 11 Pro 24H2 (build 26100)'; IsAdmin = $true; Users = @('CONTOSO\alex')
     NotLoadedProfiles = @(); Uptime = New-TimeSpan -Days 2 -Hours 5 -Minutes 41; Duration = 3.8; ScannedAt = $now; Version = $script:PssVersion
-    Boot = [pscustomobject]@{ Available = $true; Error = ''; Boots = $boots; Delays = $delays; LastBootMs = $boots[0].BootSec * 1000; LastMainMs = $boots[0].MainPathSec * 1000; LastPostMs = $boots[0].PostBootSec * 1000 }
+    Boot = [pscustomobject]@{ Available = $true; Error = ''; Boots = $boots; Delays = $delays; LastBootMs = $boots[0].BootSec * 1000; LastMainMs = $boots[0].MainPathSec * 1000; LastPostMs = $boots[0].PostBootSec * 1000; LastBootTime = $boots[0].Time }
 }
 
 # ---------------------------------------------------------------- console capture

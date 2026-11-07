@@ -198,17 +198,20 @@ function Add-PssItem {
             $f = Find-PssFile $res.Image; if ($f) { $res.Image = $f }
         } else { $res = Resolve-PssImage $Command }
     }
+    # Squirrel-style launchers ("Update.exe --processStart Discord.exe") start a different exe than the one in the command
+    $alt = ''
+    if ($Command -match '(?i)--processStart(?:AndWait)?\s+"?([^"\s]+\.exe)') { $alt = $Matches[1] }
     $it = [pscustomobject][ordered]@{
         Id = 0; Risk = 'OK'; RiskScore = 0; Category = $Category; Name = $Name; Enabled = $Enabled
         EnabledText = $(if ($Enabled) { 'Yes' } else { 'No' }); User = $User; Trigger = $Trigger
         Command = $Command; ImagePath = $(if ($res) { $res.Image } else { '' }); Via = $(if ($res) { $res.Host } else { '' })
         Location = $Location; RegKey = $RegKey; ValueName = $ValueName; ServiceName = $ServiceName; Extra = $Extra; Kind = $Kind
-        NoImage = $NoImage
+        NoImage = $NoImage; AltExe = $alt
         FileExists = $false; Size = $null; Created = $null; Modified = $null; Hidden = $false
         Publisher = $Publisher; Company = ''; Description = ''; Product = ''; Version = ''
         SignStatus = ''; Signer = ''; SignText = ''; IsMicrosoft = $false
         Running = $false; ProcCount = 0; MemoryMB = 0; CpuSec = 0; RunText = ''
-        BootDelayMs = 0; BootDelayCount = 0; BootDelayText = ''; Impact = ''
+        BootDelayMs = 0; BootDelayCount = 0; BootDelayText = ''; BootDelayLast = $null; Impact = ''
         Flags = ''; FlagList = @(); Sha256 = ''
     }
     $script:PssItems.Add($it)
@@ -235,6 +238,22 @@ function Get-PssApproved([string]$Root, [string]$Kind, [string]$Name) {
         if ($v -is [byte[]] -and $v.Length -gt 0) { return (($v[0] -band 1) -eq 0) }
         return $true
     } finally { $k.Close() }
+}
+
+function Resolve-PssMsiShortcut([string]$Lnk) {
+    # Returns the real program behind a Windows Installer advertised shortcut, or $null
+    try {
+        $wi = New-Object -ComObject WindowsInstaller.Installer
+        $get = [Reflection.BindingFlags]::GetProperty
+        $rec = $wi.GetType().InvokeMember('ShortcutTarget', $get, $null, $wi, @($Lnk))
+        $prod = $rec.GetType().InvokeMember('StringData', $get, $null, $rec, @(1))
+        $comp = $rec.GetType().InvokeMember('StringData', $get, $null, $rec, @(3))
+        if ($prod -and $comp) {
+            $path = [string]$wi.GetType().InvokeMember('ComponentPath', $get, $null, $wi, @($prod, $comp))
+            if ($path) { return $path }
+        }
+    } catch {}
+    return $null
 }
 
 function Get-PssClsid([string]$Clsid) {
@@ -312,16 +331,21 @@ function Get-PssStartupFolders {
     foreach ($fd in $folders) {
         foreach ($file in (Get-ChildItem -LiteralPath $fd.Path -File -Force -ErrorAction SilentlyContinue)) {
             if ($file.Name -eq 'desktop.ini') { continue }
-            $cmd = $file.FullName; $img = $file.FullName
+            $cmd = $file.FullName; $img = $file.FullName; $extra = ''
             if ($file.Extension -eq '.lnk' -and $shell) {
                 try {
                     $s = $shell.CreateShortcut($file.FullName)
                     if ($s.TargetPath) { $img = $s.TargetPath; $cmd = ('"{0}" {1}' -f $s.TargetPath, $s.Arguments).Trim() }
+                    # Windows Installer "advertised" shortcuts point at an icon file in C:\Windows\Installer; ask MSI for the real program
+                    if ($s.TargetPath -match '(?i)\\Installer\\\{[0-9A-F-]+\}\\') {
+                        $msi = Resolve-PssMsiShortcut $file.FullName
+                        if ($msi) { $img = $msi; $cmd = ('"{0}" {1}' -f $msi, $s.Arguments).Trim(); $extra = 'Windows Installer (advertised) shortcut' }
+                    }
                 } catch {}
             }
             $en = $true; if ($fd.Root) { $en = Get-PssApproved $fd.Root 'StartupFolder' $file.Name }
             $res = Resolve-PssImage $cmd
-            Add-PssItem -Category 'Startup Folder' -Name $file.BaseName -Location $file.FullName -Command $cmd -Image $res.Image -Enabled $en -User $fd.User -Trigger 'Logon' -Kind 'File'
+            Add-PssItem -Category 'Startup Folder' -Name $file.BaseName -Location $file.FullName -Command $cmd -Image $res.Image -Enabled $en -User $fd.User -Trigger 'Logon' -Kind 'File' -Extra $extra
         }
     }
 }
@@ -402,6 +426,15 @@ function Get-PssServices {
             $pk = (Open-PssSub $k 'Parameters'); if ($pk) { $d2 = [string](Get-PssRegValue $pk 'ServiceDll'); if ($d2) { $dll = $d2 }; $pk.Close() }
             $tk = (Open-PssSub $k 'TriggerInfo'); if ($tk) { $hasTrig = $true; $tk.Close() }
             $k.Close()
+        }
+        # Per-user service instances (e.g. cbdhsvc_2c41dfa4) keep their ServiceDll on the template service
+        if (-not $dll -and $s.ServiceName -match '^(.+)_[0-9a-fA-F]{4,}$') {
+            $tk2 = Open-PssKey "HKLM\SYSTEM\CurrentControlSet\Services\$($Matches[1])"
+            if ($tk2) {
+                $dll = [string](Get-PssRegValue $tk2 'ServiceDll')
+                $pk2 = Open-PssSub $tk2 'Parameters'; if ($pk2) { $d3 = [string](Get-PssRegValue $pk2 'ServiceDll'); if ($d3) { $dll = $d3 }; $pk2.Close() }
+                $tk2.Close()
+            }
         }
         if ($isDriver -and -not $img) { $img = "System32\drivers\$($s.ServiceName).sys" }
         $trig = if ($isDriver) { "$st start" } elseif ($delayed) { 'Automatic (delayed)' } else { 'Automatic' }
@@ -520,7 +553,11 @@ function Get-PssMisc {
             $sk = (Open-PssSub $k $sn); if (-not $sk) { continue }
             $stub = [string](Get-PssRegValue $sk 'StubPath'); $nm = [string]$sk.GetValue(''); $isOn = $sk.GetValue('IsInstalled')
             $sk.Close()
-            if ($stub) { Add-PssItem -Category 'Active Setup' -Name $(if ($nm) { $nm } else { $sn }) -Location "$p\$sn" -Command $stub -Enabled ($isOn -ne 0) -Trigger 'First logon per user' -RegKey "$p\$sn" -ValueName 'StubPath' }
+            if ($stub) {
+                # Some Windows components store a bare argument here (e.g. "U"); there is no program to check
+                $noPath = $stub -notmatch '\\|\.(exe|dll|cmd|bat|vbs|js|ps1)\b' -and -not (Resolve-PssImage $stub).Found
+                Add-PssItem -Category 'Active Setup' -Name $(if ($nm) { $nm } else { $sn }) -Location "$p\$sn" -Command $stub -Enabled ($isOn -ne 0) -Trigger 'First logon per user' -RegKey "$p\$sn" -ValueName 'StubPath' -NoImage $noPath -Extra $(if ($noPath) { 'StubPath holds no program path' } else { '' })
+            }
         }
         $k.Close()
     }
@@ -674,7 +711,7 @@ function Invoke-PssFileInfo([string[]]$Paths) {
 }
 
 function Get-PssBootPerf {
-    $res = [pscustomobject]@{ Available = $false; Error = ''; Boots = @(); Delays = @(); LastBootMs = 0; LastMainMs = 0; LastPostMs = 0 }
+    $res = [pscustomobject]@{ Available = $false; Error = ''; Boots = @(); Delays = @(); LastBootMs = 0; LastMainMs = 0; LastPostMs = 0; LastBootTime = $null }
     try {
         $events = @(Get-WinEvent -LogName 'Microsoft-Windows-Diagnostics-Performance/Operational' -FilterXPath '*[System[(EventID>=100 and EventID<=110)]]' -MaxEvents 800 -ErrorAction Stop)
     } catch {
@@ -695,7 +732,7 @@ function Get-PssBootPerf {
     }
     $res.Boots = $boots | Sort-Object Time -Descending
     $res.Delays = $delays | Sort-Object Time -Descending
-    if ($res.Boots) { $b = @($res.Boots)[0]; $res.LastBootMs = $b.BootSec * 1000; $res.LastMainMs = $b.MainPathSec * 1000; $res.LastPostMs = $b.PostBootSec * 1000 }
+    if ($res.Boots) { $b = @($res.Boots)[0]; $res.LastBootMs = $b.BootSec * 1000; $res.LastMainMs = $b.MainPathSec * 1000; $res.LastPostMs = $b.PostBootSec * 1000; $res.LastBootTime = $b.Time }
     return $res
 }
 
@@ -733,7 +770,7 @@ function Measure-PssRisk($it) {
         if ($leaf -in $sysNames -and -not $dir.StartsWith($win)) { $flags.Add("Windows process name outside the Windows folder ($leaf)"); $score += 6 }
         if ($leaf -match '\.(pdf|doc|docx|xls|xlsx|jpg|png|txt|zip)\.(exe|scr|com|pif|bat|cmd|vbs|js)$') { $flags.Add('Double file extension'); $score += 5 }
         if ($it.Hidden -and -not $dir.StartsWith($win)) { $flags.Add('Hidden file'); $score += 1 }
-        if ($it.Created -and -not $it.IsMicrosoft -and ((Get-Date) - $it.Created).TotalDays -lt 7 -and $it.FileExists) { $flags.Add('File created in the last 7 days'); $score += 1 }
+        if ($it.Created -and $it.SignStatus -ne 'Valid' -and ((Get-Date) - $it.Created).TotalDays -lt 7 -and $it.FileExists) { $flags.Add('Unsigned file created in the last 7 days'); $score += 1 }
     }
     if ($cmd) {
         if ($cmd -match '(?i)\s-e(nc|ncodedcommand|c)?\s+[A-Za-z0-9+/=]{20,}') { $flags.Add('Encoded PowerShell command'); $score += 6 }
@@ -795,26 +832,34 @@ function Invoke-PssScan {
     $info = Invoke-PssFileInfo $paths
 
     Set-PssStatus 'Reading running processes...' 82 $Status
-    $procMap = @{}
+    $procMap = @{}; $procByLeaf = @{}
     try {
         foreach ($p in (Get-CimInstance Win32_Process -Property ProcessId, ExecutablePath, WorkingSetSize, KernelModeTime, UserModeTime -ErrorAction Stop)) {
             if (-not $p.ExecutablePath) { continue }
             $key = $p.ExecutablePath.ToLowerInvariant()
-            if (-not $procMap.ContainsKey($key)) { $procMap[$key] = @{ Count = 0; WS = 0; Cpu = 0 } }
+            if (-not $procMap.ContainsKey($key)) {
+                $procMap[$key] = @{ Count = 0; WS = 0; Cpu = 0 }
+                $leafKey = [IO.Path]::GetFileName($key)
+                if (-not $procByLeaf.ContainsKey($leafKey)) { $procByLeaf[$leafKey] = New-Object System.Collections.Generic.List[string] }
+                $procByLeaf[$leafKey].Add($key)
+            }
             $procMap[$key].Count++; $procMap[$key].WS += [double]$p.WorkingSetSize; $procMap[$key].Cpu += ([double]$p.KernelModeTime + [double]$p.UserModeTime) / 1e7
         }
     } catch {}
 
     Set-PssStatus 'Reading boot performance history...' 90 $Status
     $boot = Get-PssBootPerf
+    # Boot-delay events name a process (or a service); generic host processes can't be pinned on one item
+    $hostExe = 'svchost.exe', 'rundll32.exe', 'dllhost.exe', 'taskhostw.exe', 'taskhost.exe', 'conhost.exe', 'cmd.exe', 'powershell.exe', 'pwsh.exe', 'wscript.exe', 'cscript.exe', 'mshta.exe', 'regsvr32.exe', 'msiexec.exe', 'runtimebroker.exe', 'sihost.exe', 'wmiprvse.exe', 'backgroundtaskhost.exe'
     $delayMap = @{}
     foreach ($d in $boot.Delays) {
-        foreach ($nm in @($d.Name, $d.FriendlyName)) {
-            if (-not $nm) { continue }
-            $key = ([IO.Path]::GetFileName($nm)).ToLowerInvariant()
-            if (-not $delayMap.ContainsKey($key)) { $delayMap[$key] = @{ Max = 0; Count = 0 } }
-            $delayMap[$key].Count++; if ($d.DegradationMs -gt $delayMap[$key].Max) { $delayMap[$key].Max = $d.DegradationMs }
-        }
+        if (-not $d.Name) { continue }
+        $key = ([IO.Path]::GetFileName($d.Name)).ToLowerInvariant()
+        if ($key -in $hostExe) { continue }
+        if (-not $delayMap.ContainsKey($key)) { $delayMap[$key] = @{ Max = 0; Count = 0; Last = $null } }
+        $delayMap[$key].Count++
+        if ($d.DegradationMs -gt $delayMap[$key].Max) { $delayMap[$key].Max = $d.DegradationMs }
+        if (-not $delayMap[$key].Last -or $d.Time -gt $delayMap[$key].Last) { $delayMap[$key].Last = $d.Time }
     }
 
     Set-PssStatus 'Scoring...' 96 $Status
@@ -837,17 +882,25 @@ function Invoke-PssScan {
             elseif ($it.FileExists) { $it.Publisher = '(unknown publisher)' }
         }
         $it.SignText = switch ($it.SignStatus) { 'Valid' { 'Signed' } 'NotSigned' { 'Unsigned' } '' { $(if ($it.NoImage) { 'n/a' } else { '-' }) } default { $it.SignStatus } }
-        if ($it.ImagePath) {
+        if ($it.ImagePath -and $it.ImagePath -notmatch '(?i)\\(svchost|rundll32|dllhost|explorer)\.exe$') {
             $pm = $procMap[[string]$it.ImagePath.ToLowerInvariant()]
-            if ($pm -and $it.ImagePath -notmatch '(?i)\\(svchost|rundll32|dllhost|explorer)\.exe$') {
+            if (-not $pm -and $it.AltExe) {
+                # Launcher items: look for the launched exe under the launcher's folder
+                $base = ''; try { $base = ([IO.Path]::GetDirectoryName($it.ImagePath) + '\').ToLowerInvariant() } catch {}
+                if ($base -and $procByLeaf.ContainsKey($it.AltExe.ToLowerInvariant())) {
+                    foreach ($k in $procByLeaf[$it.AltExe.ToLowerInvariant()]) { if ($k.StartsWith($base)) { $pm = $procMap[$k]; break } }
+                }
+            }
+            if ($pm) {
                 $it.Running = $true; $it.ProcCount = $pm.Count; $it.MemoryMB = [int][math]::Round($pm.WS / 1MB, 0); $it.CpuSec = [int][math]::Round($pm.Cpu, 0)
             }
         }
         $it.RunText = if ($it.ProcCount) { '{0} MB' -f $it.MemoryMB } elseif ($it.Running) { 'Running' } else { '' }
         $keys = @()
+        if ($it.AltExe) { $keys += $it.AltExe.ToLowerInvariant() }
         if ($it.ImagePath) { try { $keys += [IO.Path]::GetFileName($it.ImagePath).ToLowerInvariant() } catch {} }
         if ($it.ServiceName) { $keys += $it.ServiceName.ToLowerInvariant() }
-        foreach ($key in $keys) { if ($delayMap.ContainsKey($key)) { $it.BootDelayMs = $delayMap[$key].Max; $it.BootDelayCount = $delayMap[$key].Count; break } }
+        foreach ($key in $keys) { if ($delayMap.ContainsKey($key)) { $it.BootDelayMs = $delayMap[$key].Max; $it.BootDelayCount = $delayMap[$key].Count; $it.BootDelayLast = $delayMap[$key].Last; break } }
         if ($it.BootDelayMs) { $it.BootDelayText = '{0:N1}s' -f ($it.BootDelayMs / 1000) }
         $it.Impact = if ($it.BootDelayMs -ge 3000 -or $it.MemoryMB -ge 400) { 'High' } elseif ($it.BootDelayMs -ge 1000 -or $it.MemoryMB -ge 150 -or $it.CpuSec -ge 600) { 'Medium' } elseif ($it.Running -or $it.BootDelayMs) { 'Low' } else { '' }
         Measure-PssRisk $it
@@ -915,7 +968,10 @@ function Get-PssDetailFields($it) {
     if ($it.Extra) { $f['Notes'] = $it.Extra }
     if ($it.ProcCount) { $f['Running'] = '{0} process(es), {1} MB RAM, {2}s CPU since start' -f $it.ProcCount, $it.MemoryMB, $it.CpuSec }
     elseif ($it.Running) { $f['Running'] = 'Yes' }
-    if ($it.BootDelayMs) { $f['Boot delay'] = '{0:N1}s worst case, flagged by Windows {1} time(s)' -f ($it.BootDelayMs / 1000), $it.BootDelayCount }
+    if ($it.BootDelayMs) {
+        $f['Boot delay'] = '{0:N1}s worst case, flagged by Windows {1} time(s)' -f ($it.BootDelayMs / 1000), $it.BootDelayCount
+        if ($it.BootDelayLast) { $f['Boot delay'] += (', last on {0:yyyy-MM-dd}' -f $it.BootDelayLast) }
+    }
     if ($it.Sha256) { $f['SHA-256'] = $it.Sha256 }
     $f['Risk'] = "$($it.Risk) (score $($it.RiskScore))"
     if ($it.Flags) { $f['Flags'] = $it.Flags }
@@ -1009,7 +1065,7 @@ tr.ms{opacity:.6}.bar{display:flex;gap:12px;align-items:center;margin:8px 0;flex
 <div class="t"><b>$(@($items | Where-Object { -not $_.IsMicrosoft }).Count)</b>third-party</div>
 <div class="t"><b class="High">$(@($items | Where-Object Risk -eq 'High').Count)</b>high risk</div>
 <div class="t"><b class="Medium">$(@($items | Where-Object Risk -eq 'Medium').Count)</b>medium risk</div>
-<div class="t"><b>$(if ($Scan.Boot.LastBootMs) { '{0:N1}s' -f ($Scan.Boot.LastBootMs / 1000) } else { 'n/a' })</b>last boot</div>
+<div class="t"><b>$(if ($Scan.Boot.LastBootMs) { '{0:N1}s' -f ($Scan.Boot.LastBootMs / 1000) } else { 'n/a' })</b>last boot$(if ($Scan.Boot.LastBootTime) { ' ({0:yyyy-MM-dd})' -f $Scan.Boot.LastBootTime })</div>
 </div>
 "@)
     $row = {
@@ -1146,9 +1202,12 @@ function Write-PssDashboard($Scan) {
     $b = $Scan.Boot
     if ($b.LastBootMs) {
         $col = if ($b.LastBootMs -gt 90000) { 'Red' } elseif ($b.LastBootMs -gt 45000) { 'Yellow' } else { 'Green' }
+        $old = $b.LastBootTime -and ((Get-Date) - $b.LastBootTime).TotalDays -gt 30
         Write-Host '   Last boot      ' -NoNewline -ForegroundColor DarkGray
         Write-Host ('{0:N1}s' -f ($b.LastBootMs / 1000)) -NoNewline -ForegroundColor $col
-        Write-Host ('   (to desktop {0:N1}s, settling {1:N1}s)' -f ($b.LastMainMs / 1000), ($b.LastPostMs / 1000)) -ForegroundColor Gray
+        Write-Host ('   (to desktop {0:N1}s, settling {1:N1}s)  ' -f ($b.LastMainMs / 1000), ($b.LastPostMs / 1000)) -NoNewline -ForegroundColor Gray
+        if ($b.LastBootTime) { Write-Host ('recorded {0:yyyy-MM-dd}' -f $b.LastBootTime) -ForegroundColor $(if ($old) { 'DarkYellow' } else { 'DarkGray' }) } else { Write-Host '' }
+        if ($old) { Write-Host '                  Windows has not logged a newer boot timing, so treat these numbers as old.' -ForegroundColor DarkYellow }
         $avg = ($b.Boots | Select-Object -First 10 | Measure-Object BootSec -Average).Average
         if ($avg) { Write-Host ('   Avg last 10    {0:N1}s' -f $avg) -ForegroundColor Gray }
     } else { Write-Host "   $($b.Error)" -ForegroundColor DarkGray }
@@ -1287,7 +1346,14 @@ function Show-PssBoot($Scan) {
             Write-Host ('{0,10}' -f ('{0:N1}s' -f $x.BootSec)) -NoNewline -ForegroundColor $c
             Write-Host ('{0,12}{1,12}' -f ('{0:N1}s' -f $x.MainPathSec), ('{0:N1}s' -f $x.PostBootSec)) -ForegroundColor Gray
         }
+        if ($b.LastBootTime -and ((Get-Date) - $b.LastBootTime).TotalDays -gt 30) {
+            Write-Host ('   The newest boot timing Windows logged is from {0:yyyy-MM-dd}.' -f $b.LastBootTime) -ForegroundColor DarkYellow
+        }
         Write-PssRule 'What Windows says slowed boot (worst delay per item)'
+        if ($b.Delays) {
+            $span = $b.Delays | Measure-Object -Property Time -Minimum -Maximum
+            Write-Host ('   Logged between {0:yyyy-MM-dd} and {1:yyyy-MM-dd}' -f $span.Minimum, $span.Maximum) -ForegroundColor DarkGray
+        }
         $top = @($b.Delays | Group-Object { "$($_.Type)|$($_.Name)" } | ForEach-Object {
                 $g = $_.Group | Sort-Object DegradationMs -Descending | Select-Object -First 1
                 [pscustomobject]@{ Name = $(if ($g.FriendlyName) { $g.FriendlyName } else { $g.Name }); File = $g.Name; Type = $g.Type; Max = $g.DegradationMs; Count = $_.Count; Last = ($_.Group | Sort-Object Time -Descending | Select-Object -First 1).Time }
@@ -1634,7 +1700,7 @@ function Show-PssGui($Scan, [string]$Snapshot) {
         [void]$ui.Tiles.Children.Add((& $makeTile @($s.Items | Where-Object { -not $_.IsMicrosoft }).Count 'third-party' '#E6E8EE'))
         [void]$ui.Tiles.Children.Add((& $makeTile @($s.Items | Where-Object Risk -eq 'High').Count 'high risk' '#FF7B7B'))
         [void]$ui.Tiles.Children.Add((& $makeTile @($s.Items | Where-Object Risk -eq 'Medium').Count 'medium risk' '#FBBF24'))
-        [void]$ui.Tiles.Children.Add((& $makeTile $(if ($s.Boot.LastBootMs) { '{0:N1}s' -f ($s.Boot.LastBootMs / 1000) } else { 'n/a' }) 'last boot' '#38BDF8'))
+        [void]$ui.Tiles.Children.Add((& $makeTile $(if ($s.Boot.LastBootMs) { '{0:N1}s' -f ($s.Boot.LastBootMs / 1000) } else { 'n/a' }) $(if ($s.Boot.LastBootTime) { 'last boot, {0:MMM d}' -f $s.Boot.LastBootTime } else { 'last boot' }) '#38BDF8'))
         $cats = @('All categories') + @($s.Items | ForEach-Object Category | Sort-Object -Unique)
         $prev = $ui.Cat.SelectedItem
         $ui.Cat.ItemsSource = $cats

@@ -85,7 +85,7 @@ Press `G` from the menu or run with `-Gui`. The GUI is a single lightweight wind
 |---|---|
 | Run keys | `Run`, `RunOnce`, `RunServices`, `Policies\Explorer\Run` and their 32-bit `WOW6432Node` versions, for the machine **and every logged-on user**. Items disabled in Task Manager show as `[off]` |
 | Legacy load points | `Windows NT\CurrentVersion\Windows` `Load` / `Run` |
-| Startup folders | The all-users folder and every profile's folder, with shortcuts resolved to their target |
+| Startup folders | The all-users folder and every profile's folder, with shortcuts resolved to their target (including Windows Installer "advertised" shortcuts) |
 | Scheduled tasks | All tasks, including hidden ones, with triggers (boot, logon, schedule, event...), run-as account, author and last run |
 | Services | Automatic and delayed-start services. For `svchost` services the real service DLL is checked |
 | Drivers | Boot, system and automatic-start drivers |
@@ -119,7 +119,7 @@ Each item collects points from flags. **6+ = High**, **3-5 = Medium**, **1-2 = L
 | Unsigned file in AppData or a top-level ProgramData folder, script file, Windows Script Host, hidden window | 2 |
 | IFEO entry that points to a Microsoft-signed tool | 2 |
 | Unquoted service path with spaces, file not found (orphaned entry) | 2 |
-| Hidden file, created in the last 7 days (non-Microsoft), signature couldn't be checked | 1 |
+| Hidden file, unsigned file created in the last 7 days, signature couldn't be checked | 1 |
 
 Scoring is a triage aid, not a verdict. Plenty of legitimate software is unsigned, and malware can be signed. Use the details view, the hash and VirusTotal to decide.
 
@@ -131,6 +131,11 @@ With admin rights the scanner reads Windows' own boot diagnostics log (`Diagnost
 - **Slow items:** every app, service and driver Windows recorded as slowing boot, with its worst delay.
 
 Those delays are matched back to startup items, and each item also shows its live memory and CPU use. Together this shows what is actually costing time instead of just guessing.
+
+Matching takes some care:
+- **Launchers:** for apps started through a launcher, such as `Update.exe --processStart Discord.exe`, the delay and memory of the app that actually runs are used.
+- **Shared processes:** delays logged against shared host processes like `svchost.exe` aren't pinned on any one item.
+- **Dates:** each figure carries the date Windows recorded it, and the dashboard warns when the newest boot timing is more than 30 days old.
 
 ## Requirements
 
