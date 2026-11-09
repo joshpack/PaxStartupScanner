@@ -4,9 +4,9 @@
 #>
 param([string]$OutDir = (Join-Path $PSScriptRoot '..\docs\screenshots'))
 
-$main = Join-Path $PSScriptRoot '..\PaxStartupScanner.ps1'
+$main = Join-Path $PSScriptRoot '..\pxdStartupScanner.ps1'
 $text = [IO.File]::ReadAllText($main)
-$text = $text.Substring(0, $text.LastIndexOf('Start-PaxStartupScanner -Gui'))
+$text = $text.Substring(0, $text.LastIndexOf('Start-pxdStartupScanner -Gui'))
 . ([scriptblock]::Create($text))
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
@@ -67,7 +67,7 @@ function Get-PssBootTests {
 }
 function Get-PssChangeHistory { @([pscustomobject]@{ Time = $now.AddHours(-2); Action = 'Disable'; Category = 'Run Key'; Name = 'Discord'; Undone = $false }, [pscustomobject]@{ Time = $now.AddHours(-2).AddMinutes(1); Action = 'Delete'; Category = 'Scheduled Task'; Name = '\OneDrive Sync Task'; Undone = $false }) }
 function Get-PssBootTestState { $null }
-# Sample undo history for the Undo tab screenshot (the real list reads %ProgramData%\PaxStartupScanner\Backups)
+# Sample undo history for the Undo tab screenshot (the real list reads %ProgramData%\pxdStartupScanner\Backups)
 function Get-PssUndoRecords {
     @(
         [pscustomobject]@{ When = $now.AddMinutes(-2).ToString('yyyy-MM-dd HH:mm'); Action = 'Delete'; Category = 'Scheduled Task'; Name = '\OneDrive Sync Task'; Location = 'Task Scheduler \OneDrive Sync Task'; RunBy = 'CONTOSO\it-admin'; Steps = @() }

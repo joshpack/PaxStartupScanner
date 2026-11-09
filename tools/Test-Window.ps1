@@ -5,9 +5,9 @@
 #>
 param([string]$OutDir = (Join-Path ([IO.Path]::GetTempPath()) 'pss-window-test'))
 
-$main = Join-Path $PSScriptRoot '..\PaxStartupScanner.ps1'
+$main = Join-Path $PSScriptRoot '..\pxdStartupScanner.ps1'
 $text = [IO.File]::ReadAllText($main)
-$text = $text.Substring(0, $text.LastIndexOf('Start-PaxStartupScanner -Gui'))
+$text = $text.Substring(0, $text.LastIndexOf('Start-pxdStartupScanner -Gui'))
 . ([scriptblock]::Create($text))
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null

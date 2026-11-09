@@ -1,19 +1,19 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    PAX Startup Scanner - finds everything that starts with Windows, shows what it is and where
+    pxd Startup Scanner - finds everything that starts with Windows, shows what it is and where
     it lives, flags suspicious entries and shows what is slowing boot down.
 
 .DESCRIPTION
     IT diagnostic tool. Nothing is installed. It only changes the system when you choose
     Disable or Delete on an item; every change is backed up to
-    %ProgramData%\PaxStartupScanner\Backups first and can be undone from the Undo list.
+    %ProgramData%\pxdStartupScanner\Backups first and can be undone from the Undo list.
     Run it from an elevated PowerShell prompt straight from GitHub:
 
-        irm paxdigi.com/startup | iex
+        irm pxdtek.com/ss | iex
 
-    (the short address forwards to
-        https://raw.githubusercontent.com/joshpack/PaxStartupScanner/main/PaxStartupScanner.ps1)
+    (pxdtek.com serves the latest copy of
+        https://raw.githubusercontent.com/joshpack/pxdStartupScanner/main/pxdStartupScanner.ps1)
 
     Scans: Run/RunOnce keys (machine + every loaded user), startup folders (all profiles),
     scheduled tasks, auto-start services and drivers, Winlogon, Explorer hooks, AppInit DLLs,
@@ -39,8 +39,9 @@ param(
     [switch]$ReadOnly
 )
 
-$script:PssVersion = '1.5.0'
-$script:PssUrl     = 'https://raw.githubusercontent.com/joshpack/PaxStartupScanner/main/PaxStartupScanner.ps1'
+$script:PssVersion = '1.6.0'
+$script:PssAppId   = 'pxdStartupScanner'
+$script:PssUrl     = 'https://raw.githubusercontent.com/joshpack/pxdStartupScanner/main/pxdStartupScanner.ps1'
 $script:PssSelfPath = $PSCommandPath   # empty when run through irm | iex
 
 # ======================================================================================
@@ -827,9 +828,13 @@ function Measure-PssRisk($it) {
         'Run Key' { if ($it.Name -match '^Windows\\(Load|Run)$') { $flags.Add('Legacy load point'); $score += 3 } }
     }
     # The scanner's own boot-test tasks (hidden PowerShell running a script in ProgramData would otherwise be flagged)
-    if ($it.Category -eq 'Scheduled Task' -and $it.Name -like '\PAX Startup Scanner\*' -and $cmd -match '(?i)\\PaxStartupScanner\\boot-probe\.ps1') {
+    # (also the ones an older version armed under the former name, until the migration re-arms them)
+    $ownTask = $false
+    foreach ($n in @('pxd Startup Scanner', (Get-PssFormerName 'pxd Startup Scanner'))) { if ($it.Name -like "\$n\*") { $ownTask = $true } }
+    $ownProbe = $cmd -match ('(?i)\\(' + $script:PssAppId + '|' + (Get-PssFormerName $script:PssAppId) + ')\\boot-probe\.ps1')
+    if ($it.Category -eq 'Scheduled Task' -and $ownTask -and $ownProbe) {
         $flags.Clear(); $score = 0
-        $it.Extra = 'PAX Startup Scanner boot test. It runs once at the next restart and then removes itself.'
+        $it.Extra = 'pxd Startup Scanner boot test. It runs once at the next restart and then removes itself.'
     }
     $it.FlagList = @($flags)
     $it.Flags = ($flags -join '; ')
@@ -1044,10 +1049,10 @@ function Get-PssHash($it) {
 function Open-PssLocation($it) {
     if ($it.RegKey) {
         $full = $it.RegKey -replace '^HKLM\\', 'HKEY_LOCAL_MACHINE\' -replace '^HKU\\', 'HKEY_USERS\'
-        if ($script:PssReadOnly) {
+        if ($script:PssReadOnly -or $script:PssInMemory) {
             # Jumping Regedit to a key means writing its LastKey setting; read-only mode copies the path instead
             try { Set-Clipboard -Value "Computer\$full" } catch {}
-            $script:PssLastNote = 'Read-only mode: the registry path was copied to the clipboard (paste it into Regedit''s address bar).'
+            $script:PssLastNote = $(if ($script:PssReadOnly) { 'Read-only mode' } else { 'In-memory mode' }) + ': the registry path was copied to the clipboard (paste it into Regedit''s address bar).'
             Start-Process regedit.exe -ArgumentList '/m'
             return
         }
@@ -1093,7 +1098,7 @@ function Export-PssReport($Scan, [string]$Path, [string]$Note = '') {
     $flagged = @($items | Where-Object { $_.Risk -in 'High', 'Medium' })
     [void]$sb.Append(@"
 <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PAX Startup Scanner - $(& $e $Scan.Computer)</title>
+<title>pxd Startup Scanner - $(& $e $Scan.Computer)</title>
 <style>
 :root{--bg:#0f1115;--card:#171a21;--line:#262b36;--fg:#e6e8ee;--mut:#8b93a5;--hi:#ef4444;--me:#f59e0b;--lo:#38bdf8;--ok:#22c55e}
 @media (prefers-color-scheme: light){:root{--bg:#f6f7f9;--card:#fff;--line:#e3e6ec;--fg:#151821;--mut:#5d6575}}
@@ -1106,7 +1111,7 @@ td.p{font-family:Consolas,monospace;font-size:12px;word-break:break-all}.r{font-
 tr.ms{opacity:.6}.bar{display:flex;gap:12px;align-items:center;margin:8px 0;flex-wrap:wrap}input[type=search]{padding:6px 10px;border-radius:6px;border:1px solid var(--line);background:var(--card);color:var(--fg);min-width:260px}
 .wrap{overflow-x:auto}
 </style></head><body><main>
-<h1>PAX Startup Scanner report</h1>
+<h1>pxd Startup Scanner report</h1>
 <div class="mut">$(& $e $Scan.Computer) &middot; $(& $e $Scan.OS) &middot; scanned $('{0:yyyy-MM-dd HH:mm}' -f $Scan.ScannedAt) &middot; elevated: $(if ($Scan.IsAdmin) { 'yes' } else { 'no' }) &middot; v$($Scan.Version)</div>
 $(if ($Note) { "<div class=`"mut`">Filtered view: $(& $e $Note)</div>" })
 <div class="tiles">
@@ -1151,7 +1156,7 @@ q.oninput=f;ms.onchange=f;f();
 
 # ======================================================================================
 #  Changes: Disable / Enable / Delete with backups, and Undo
-#  Every change writes an undo record to %ProgramData%\PaxStartupScanner\Backups before
+#  Every change writes an undo record to %ProgramData%\pxdStartupScanner\Backups before
 #  anything is touched; the record is removed again if the change fails.
 # ======================================================================================
 
@@ -1216,7 +1221,95 @@ function Set-PssPermissions($it) {
     if (-not $it.CanDisable -and -not $it.CanDelete -and -not $it.ActionNote) { $it.ActionNote = "This entry can't be changed from here." }
 }
 
-function Get-PssDataPath { return (Join-Path $env:ProgramData 'PaxStartupScanner') }
+function Get-PssDataPath {
+    # %ProgramData%\pxdStartupScanner: undo records (Backups), boot tests and the boot-test probe.
+    # Until the one-time migration has moved an older version's folder (that needs an elevated run), that folder is used.
+    $new = Join-Path $env:ProgramData $script:PssAppId
+    if (-not (Test-Path -LiteralPath $new)) {
+        $old = Join-Path $env:ProgramData (Get-PssFormerName $script:PssAppId)
+        if (Test-Path -LiteralPath $old) { return $old }
+    }
+    return $new
+}
+
+# ---- One-time migration from the former name (1.6.0) ---------------------------------------------------------------
+# Before 1.6.0 the scanner had another name and kept its data under it. $script:PssFormerPrefix and the functions in
+# this block are the only places that name what those versions left behind. Safe to repeat, never throws, and it
+# writes nothing in read-only mode.
+$script:PssFormerPrefix = 'Pax'   # migration only: the prefix the app had before the rename
+
+function Get-PssFormerName([string]$Name) {
+    # 'pxdStartupScanner' -> the former folder name; 'pxd Startup Scanner' -> the former task folder name
+    if ($Name.StartsWith('pxd ')) { return $script:PssFormerPrefix.ToUpperInvariant() + $Name.Substring(3) }
+    if ($Name.StartsWith('pxd')) { return $script:PssFormerPrefix + $Name.Substring(3) }
+    return $Name
+}
+
+function Copy-PssTree([string]$From, [string]$To) {
+    [void][IO.Directory]::CreateDirectory($To)
+    foreach ($f in [IO.Directory]::GetFiles($From)) { try { [IO.File]::Copy($f, (Join-Path $To ([IO.Path]::GetFileName($f))), $false) } catch {} }
+    foreach ($d in [IO.Directory]::GetDirectories($From)) { Copy-PssTree $d (Join-Path $To ([IO.Path]::GetFileName($d))) }
+}
+
+function Move-PssFolder([string]$Old, [string]$New) {
+    # Same as pxdMigrate.Folder: moves Old to New when only Old exists; when a move isn't possible (a file in use),
+    # copies what it can and leaves Old. True if it moved.
+    try {
+        if (-not [IO.Directory]::Exists($Old) -or [IO.Directory]::Exists($New)) { return $false }
+        $parent = [IO.Path]::GetDirectoryName($New)
+        if ($parent) { [void][IO.Directory]::CreateDirectory($parent) }
+        try { [IO.Directory]::Move($Old, $New) }
+        catch {
+            $ex = $_.Exception; if ($ex.InnerException) { $ex = $ex.InnerException }
+            if ($ex -isnot [IO.IOException]) { return $false }   # access denied: leave it for an elevated run
+            Copy-PssTree $Old $New
+        }
+        return $true
+    } catch { return $false }
+}
+
+function Get-PssFormerTaskPath { return ('\' + (Get-PssFormerName 'pxd Startup Scanner') + '\') }
+
+function Get-PssFormerBootTasks {
+    # The boot-test tasks an older version armed (they run its probe from the former data folder)
+    try { return @(Get-ScheduledTask -TaskPath (Get-PssFormerTaskPath) -ErrorAction Stop) } catch { return @() }
+}
+
+function Remove-PssFormerBootTasks {
+    $path = Get-PssFormerTaskPath
+    foreach ($t in 'Boot test - startup', 'Boot test - sign-in') { Unregister-ScheduledTask -TaskName $t -TaskPath $path -Confirm:$false -ErrorAction SilentlyContinue }
+    try { $svc = New-Object -ComObject Schedule.Service; $svc.Connect(); $svc.GetFolder('\').DeleteFolder($path.Trim('\'), 0) } catch {}
+}
+
+function Invoke-PssMigration {
+    # Runs at start-up before anything reads settings. Returns what it did (one line per step).
+    param([string]$ProgramDataRoot = $env:ProgramData, [string]$AppDataRoot = [Environment]::GetFolderPath('ApplicationData'), [bool]$IsAdmin = $false)
+    $done = New-Object System.Collections.Generic.List[string]
+    if ($script:PssReadOnly) { return , $done }
+    try {
+        # 1) Per-user settings (window placement). Skipped when PSS_CONFIG_DIR points elsewhere (tests) unless a root is given.
+        if (-not $env:PSS_CONFIG_DIR -or $PSBoundParameters.ContainsKey('AppDataRoot')) {
+            $old = Join-Path $AppDataRoot (Get-PssFormerName $script:PssAppId); $new = Join-Path $AppDataRoot $script:PssAppId
+            if (Move-PssFolder $old $new) { $done.Add("settings: $old -> $new") }
+        }
+        # 2) Machine data (undo records, boot tests). The folder is made by an elevated run, so moving it needs one too;
+        #    until then Get-PssDataPath keeps using the former folder, so nothing is lost.
+        if ($IsAdmin) {
+            $old = Join-Path $ProgramDataRoot (Get-PssFormerName $script:PssAppId); $new = Join-Path $ProgramDataRoot $script:PssAppId
+            $tasks = @(Get-PssFormerBootTasks)
+            if (Move-PssFolder $old $new) {
+                $done.Add("data: $old -> $new")
+                if ($tasks.Count) {
+                    # A boot test armed by an older version: re-arm it under the new name with the moved folder
+                    $r = Register-PssBootTasks $new
+                    if ($r.Ok) { Remove-PssFormerBootTasks; $done.Add('boot test: re-armed under the new task folder') }
+                    else { [void](Move-PssFolder $new $old) }   # keep the armed test working; try again next time
+                }
+            }
+        }
+    } catch {}
+    return , $done
+}
 
 function Get-PssBackupPath { return (Join-Path (Get-PssDataPath) 'Backups') }
 
@@ -1279,6 +1372,8 @@ function Restore-PssRegValue($s) {
 function Save-PssUndo($it, [string]$Action, $Steps) {
     # $Steps is a List[object]; use ToArray() because @($list) on a List[object] throws
     # "Argument types do not match" in Windows PowerShell 5.1
+    # In-memory mode keeps no undo record (the change was confirmed with that warning); returns ''
+    if ($script:PssInMemory) { return '' }
     $rec = [pscustomobject][ordered]@{
         Version = 1; Time = (Get-Date).ToString('o'); Computer = $env:COMPUTERNAME; RunBy = "$env:USERDOMAIN\$env:USERNAME"
         Action = $Action; Category = $it.Category; Name = $it.Name; Location = $it.Location; ValueName = $it.ValueName; Command = $it.Command
@@ -1293,7 +1388,7 @@ function Complete-PssChange([string]$Record, [scriptblock]$Apply, [string[]]$Cle
     # Runs the change; if it fails, the undo record (and any backup files) are removed so nothing is left half-done
     try { $null = & $Apply }
     catch {
-        Remove-Item -LiteralPath $Record -ErrorAction SilentlyContinue
+        if ($Record) { Remove-Item -LiteralPath $Record -ErrorAction SilentlyContinue }
         foreach ($c in $Cleanup) { if ($c) { Remove-Item -LiteralPath $c -ErrorAction SilentlyContinue } }
         throw
     }
@@ -1396,7 +1491,8 @@ function Get-PssConfirmText($it, [string]$Action) {
             $t += "`n"
         }
     }
-    $t += "A backup is saved to $(Get-PssBackupPath) so you can undo this."
+    if ($script:PssInMemory) { $t += "In-memory mode: this change has no backup and can't be undone from here." }
+    else { $t += "A backup is saved to $(Get-PssBackupPath) so you can undo this." }
     return $t
 }
 
@@ -1410,7 +1506,7 @@ function Invoke-PssChange($it, [string]$Action) {
     $rec = ''
     try {
         Initialize-PssRegistry
-        $null = Get-PssBackupDir
+        if (-not $script:PssInMemory) { $null = Get-PssBackupDir }
         switch ($op.Type) {
             'RegValue' {
                 if ($Action -eq 'Delete') {
@@ -1426,6 +1522,11 @@ function Invoke-PssChange($it, [string]$Action) {
             'File' {
                 if ($Action -eq 'Delete') {
                     if (-not (Test-Path -LiteralPath $op.Path)) { throw 'The file is already gone.' }
+                    if ($script:PssInMemory) {
+                        # no backup folder: the entry file is deleted for good (the user confirmed that)
+                        Remove-Item -LiteralPath $op.Path -Force -ErrorAction Stop
+                        break
+                    }
                     $dest = Join-Path (Get-PssBackupDir) (New-PssBackupName ('_' + [IO.Path]::GetFileName($op.Path)))
                     $steps.Add(@{ T = 'File'; From = $dest; To = $op.Path })
                     $rec = Save-PssUndo $it $Action $steps
@@ -1459,6 +1560,13 @@ function Invoke-PssChange($it, [string]$Action) {
                 } finally { $k.Close() }
             }
             'RegKey' {
+                $i = $op.Key.LastIndexOf('\')
+                if ($script:PssInMemory) {
+                    # no .reg export: the key is removed for good (the user confirmed that)
+                    $parent = Open-PssKeyW $op.Key.Substring(0, $i)
+                    try { $parent.DeleteSubKeyTree($op.Key.Substring($i + 1), $false) } finally { $parent.Close() }
+                    break
+                }
                 $file = Join-Path (Get-PssBackupDir) (New-PssBackupName '.reg')
                 $out = & reg.exe export $op.Key $file /y /reg:64 2>&1
                 if ($LASTEXITCODE -ne 0) { throw "Couldn't back up $($op.Key): $((($out | Out-String) -replace '\s+', ' ').Trim())" }
@@ -1519,8 +1627,13 @@ function Invoke-PssChange($it, [string]$Action) {
     $msg = switch ($Action) {
         'Disable' { if ($it.Category -in 'Service', 'Driver') { "Disabled $($it.Name). It won't start with Windows after the next restart." } else { "Disabled $($it.Name). It won't start automatically any more." } }
         'Enable' { "Enabled $($it.Name) again." }
-        default { if ($op.Type -eq 'Wmi') { "Removed the WMI subscription $($it.Name). Its definition is saved in the backup folder." } else { "Deleted the startup entry for $($it.Name). Undo can put it back." } }
+        default {
+            if ($script:PssInMemory) { "Deleted the startup entry for $($it.Name)." }
+            elseif ($op.Type -eq 'Wmi') { "Removed the WMI subscription $($it.Name). Its definition is saved in the backup folder." }
+            else { "Deleted the startup entry for $($it.Name). Undo can put it back." }
+        }
     }
+    if ($script:PssInMemory) { $msg += ' (In-memory mode: no backup was kept.)' }
     return @{ Ok = $true; Message = $msg; Record = $rec }
 }
 
@@ -1613,6 +1726,8 @@ function Get-PssSnapshotSteps($it) {
         'StoreApp' { & $addValue $op.Key 'State' }
         'ListPart' { & $addValue $op.Key $op.Name }
         'RegKey' {
+            # reg.exe can only export to a file, so in-memory mode (no temp files) leaves these keys out
+            if ($script:PssInMemory) { break }
             $tmp = Join-Path $env:TEMP ('pss-export-' + [guid]::NewGuid().ToString('N') + '.reg')
             try {
                 $null = & reg.exe export $op.Key $tmp /y /reg:64 2>&1
@@ -1645,7 +1760,7 @@ function New-PssSnapshot($Scan) {
         }
     } finally { $script:PssReadOnly = $ro }
     $snap = [pscustomobject][ordered]@{
-        Format = 'PaxStartupScanner.Backup'; Version = 1; Computer = $env:COMPUTERNAME; Time = (Get-Date).ToString('o')
+        Format = 'pxdStartupScanner.Backup'; Version = 1; Computer = $env:COMPUTERNAME; Time = (Get-Date).ToString('o')
         RunBy = "$env:USERDOMAIN\$env:USERNAME"; ScannerVersion = $script:PssVersion; Count = $entries.Count; Skipped = $skipped
         Items = $entries.ToArray()
     }
@@ -1655,13 +1770,15 @@ function New-PssSnapshot($Scan) {
 function Read-PssSnapshot([string]$Json) {
     $s = $null
     try { $s = $Json | ConvertFrom-Json } catch {}
-    if (-not $s -or $s.Format -ne 'PaxStartupScanner.Backup') { throw "That isn't a PAX Startup Scanner backup." }
+    # full backups saved by older versions carry the former name (migration: still accepted)
+    if (-not $s -or $s.Format -notin ($script:PssAppId + '.Backup'), ((Get-PssFormerName $script:PssAppId) + '.Backup')) { throw "That isn't a pxd Startup Scanner backup." }
     return $s
 }
 
 function Restore-PssSnapshot($Snap) {
     # Puts every entry in a full backup back the way it was. Returns @{ Ok; Message; Failed }
     if ($script:PssReadOnly) { return @{ Ok = $false; Message = 'Read-only mode: nothing on this PC is changed.'; Failed = @() } }
+    if ($script:PssInMemory) { return @{ Ok = $false; Message = 'In-memory mode: restoring a full backup is not available (a restore saves undo backups on this PC first).'; Failed = @() } }
     Initialize-PssRegistry
     $failed = @(); $done = 0
     foreach ($e in @($Snap.Items)) {
@@ -1677,6 +1794,7 @@ function Restore-PssSnapshot($Snap) {
 function Invoke-PssUndo($Rec) {
     # Replays the record's backup steps in reverse, then files the record under Backups\Restored
     if ($script:PssReadOnly) { return @{ Ok = $false; Message = 'Read-only mode: nothing on this PC is changed.' } }
+    if ($script:PssInMemory) { return @{ Ok = $false; Message = 'In-memory mode: Undo is not available (nothing is saved on this PC).' } }
     $steps = @($Rec.Steps)
     [array]::Reverse($steps)
     try {
@@ -1697,17 +1815,17 @@ function Invoke-PssUndo($Rec) {
 
 # ======================================================================================
 #  Boot tests: time real restarts before and after changes and compare them
-#  Arming writes boot-probe.ps1 to %ProgramData%\PaxStartupScanner and registers two one-shot
+#  Arming writes boot-probe.ps1 to %ProgramData%\pxdStartupScanner and registers two one-shot
 #  SYSTEM tasks (at startup, at sign-in). They record when Windows went idle at the sign-in
 #  screen and when the desktop went idle after sign-in (time spent typing the password is not
 #  counted), save the result to BootTests\, then remove the tasks and the probe.
 # ======================================================================================
 
 $script:PssProbeScript = @'
-# PAX Startup Scanner boot test probe (runs once at the next startup and sign-in, then removes itself)
+# pxd Startup Scanner boot test probe (runs once at the next startup and sign-in, then removes itself)
 param([ValidateSet('startup', 'logon')][string]$Phase = 'logon', [string]$OutDir = '', [int]$MaxSeconds = 600, [switch]$NoDisarm, [string]$TestStart = '')
 $ErrorActionPreference = 'Continue'
-$root = Join-Path $env:ProgramData 'PaxStartupScanner'
+$root = Join-Path $env:ProgramData 'pxdStartupScanner'
 if (-not $OutDir) { $OutDir = Join-Path $root 'BootTests' }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
@@ -1786,8 +1904,8 @@ $rec.Finished = (Get-Date).ToString('o')
 $rec | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $OutDir "$id-$Phase.json") -Encoding UTF8
 
 if ($Phase -eq 'logon' -and -not $NoDisarm) {
-    foreach ($t in 'Boot test - startup', 'Boot test - sign-in') { Unregister-ScheduledTask -TaskName $t -TaskPath '\PAX Startup Scanner\' -Confirm:$false -ErrorAction SilentlyContinue }
-    try { $svc = New-Object -ComObject Schedule.Service; $svc.Connect(); $svc.GetFolder('\').DeleteFolder('PAX Startup Scanner', 0) } catch {}
+    foreach ($t in 'Boot test - startup', 'Boot test - sign-in') { Unregister-ScheduledTask -TaskName $t -TaskPath '\pxd Startup Scanner\' -Confirm:$false -ErrorAction SilentlyContinue }
+    try { $svc = New-Object -ComObject Schedule.Service; $svc.Connect(); $svc.GetFolder('\').DeleteFolder('pxd Startup Scanner', 0) } catch {}
     Remove-Item -LiteralPath (Join-Path $root 'boot-test.json') -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $PSCommandPath -ErrorAction SilentlyContinue
 }
@@ -1807,8 +1925,9 @@ function Get-PssBootTestState {
 }
 
 function Stop-PssBootTest {
-    foreach ($t in 'Boot test - startup', 'Boot test - sign-in') { Unregister-ScheduledTask -TaskName $t -TaskPath '\PAX Startup Scanner\' -Confirm:$false -ErrorAction SilentlyContinue }
-    try { $svc = New-Object -ComObject Schedule.Service; $svc.Connect(); $svc.GetFolder('\').DeleteFolder('PAX Startup Scanner', 0) } catch {}
+    if ($script:PssInMemory) { return @{ Ok = $false; Message = 'In-memory mode: boot tests are not available.' } }
+    foreach ($t in 'Boot test - startup', 'Boot test - sign-in') { Unregister-ScheduledTask -TaskName $t -TaskPath '\pxd Startup Scanner\' -Confirm:$false -ErrorAction SilentlyContinue }
+    try { $svc = New-Object -ComObject Schedule.Service; $svc.Connect(); $svc.GetFolder('\').DeleteFolder('pxd Startup Scanner', 0) } catch {}
     $root = Get-PssDataPath
     Remove-Item -LiteralPath (Join-Path $root 'boot-test.json') -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath (Join-Path $root 'boot-probe.ps1') -ErrorAction SilentlyContinue
@@ -1818,15 +1937,29 @@ function Stop-PssBootTest {
 function Start-PssBootTest([string]$Label) {
     # Arms a one-shot timing of the next restart (needs admin: the tasks run as SYSTEM)
     if ($script:PssReadOnly) { return @{ Ok = $false; Message = 'Read-only mode: boot tests are off (they need scheduled tasks on this PC).' } }
+    if ($script:PssInMemory) { return @{ Ok = $false; Message = 'In-memory mode: boot tests are not available (they need a probe and scheduled tasks saved on this PC).' } }
     $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $isAdmin) { return @{ Ok = $false; Message = 'Timing a restart needs an elevated PowerShell (Run as Administrator).' } }
     if (-not $Label) { $Label = 'Boot test {0:yyyy-MM-dd HH:mm}' -f (Get-Date) }
     try {
         $root = Get-PssDataPath
         if (-not (Test-Path -LiteralPath $root)) { New-Item -ItemType Directory -Path $root -Force -ErrorAction Stop | Out-Null }
-        $probe = Join-Path $root 'boot-probe.ps1'
-        Set-Content -LiteralPath $probe -Value $script:PssProbeScript -Encoding UTF8 -ErrorAction Stop
         [pscustomobject]@{ Label = $Label; ArmedAt = (Get-Date).ToString('o'); ArmedBy = "$env:USERDOMAIN\$env:USERNAME" } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'boot-test.json') -Encoding UTF8 -ErrorAction Stop
+        $r = Register-PssBootTasks $root
+        if (-not $r.Ok) { throw $r.Message }
+        return @{ Ok = $true; Message = "Boot test '$Label' is ready. Restart the PC (Restart, not Shut down) and sign in. The result shows up here once the desktop has settled." }
+    } catch {
+        $err = Format-PssError $_
+        $null = Stop-PssBootTest
+        return @{ Ok = $false; Message = $err }
+    }
+}
+
+function Register-PssBootTasks([string]$Root) {
+    # Writes the probe to $Root and registers the two one-shot SYSTEM tasks that run it. Returns @{ Ok; Message }
+    try {
+        $probe = Join-Path $Root 'boot-probe.ps1'
+        Set-Content -LiteralPath $probe -Value $script:PssProbeScript -Encoding UTF8 -ErrorAction Stop
         $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
@@ -1836,12 +1969,13 @@ function Start-PssBootTest([string]$Label) {
         )
         foreach ($d in $defs) {
             $act = New-ScheduledTaskAction -Execute $ps -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Phase {1}' -f $probe, $d.Phase)
-            Register-ScheduledTask -TaskName $d.Name -TaskPath '\PAX Startup Scanner\' -Action $act -Trigger $d.Trigger -Principal $principal -Settings $settings -Description 'PAX Startup Scanner: times the next restart, then removes itself.' -Force -ErrorAction Stop | Out-Null
+            Register-ScheduledTask -TaskName $d.Name -TaskPath '\pxd Startup Scanner\' -Action $act -Trigger $d.Trigger -Principal $principal -Settings $settings -Description 'pxd Startup Scanner: times the next restart, then removes itself.' -Force -ErrorAction Stop | Out-Null
         }
-        return @{ Ok = $true; Message = "Boot test '$Label' is ready. Restart the PC (Restart, not Shut down) and sign in. The result shows up here once the desktop has settled." }
+        return @{ Ok = $true; Message = '' }
     } catch {
         $err = Format-PssError $_
-        $null = Stop-PssBootTest
+        # take back a half-registered pair (the caller decides what happens to the data folder)
+        foreach ($t in 'Boot test - startup', 'Boot test - sign-in') { Unregister-ScheduledTask -TaskName $t -TaskPath '\pxd Startup Scanner\' -Confirm:$false -ErrorAction SilentlyContinue }
         return @{ Ok = $false; Message = $err }
     }
 }
@@ -1849,7 +1983,8 @@ function Start-PssBootTest([string]$Label) {
 function Restart-PssNow {
     # Full restart (a "Shut down" with Fast Startup would skip the startup measurement)
     if ($script:PssReadOnly) { return @{ Ok = $false; Message = 'Read-only mode: the scanner does not restart the PC.' } }
-    $out = & shutdown.exe /r /t 15 /c "PAX Startup Scanner boot test: restarting in 15 seconds." 2>&1
+    if ($script:PssInMemory) { return @{ Ok = $false; Message = 'In-memory mode: boot tests (and their restart) are not available.' } }
+    $out = & shutdown.exe /r /t 15 /c "pxd Startup Scanner boot test: restarting in 15 seconds." 2>&1
     if ($LASTEXITCODE -ne 0) { return @{ Ok = $false; Message = ((($out | Out-String) -replace '\s+', ' ').Trim()) } }
     return @{ Ok = $true; Message = 'Restarting in 15 seconds. To stop it, run: shutdown /a' }
 }
@@ -1940,7 +2075,7 @@ function Compare-PssBootTests($Old, $New) {
         & $add ('  {0,-64}{1,9} ->{2,9}' -f 'Programs started after sign-in', $Old.ProcessesStarted, $New.ProcessesStarted) 'Gray'
     }
     & $add ''
-    & $add 'Changes made with PAX Startup Scanner between the two tests:' 'White'
+    & $add 'Changes made with pxd Startup Scanner between the two tests:' 'White'
     $changes = @(Get-PssChangeHistory | Where-Object { $_.Time -gt $Old.Boot -and $_.Time -lt $New.Boot })
     if (-not $changes) { & $add '  None recorded. Windows updates, new software and other changes also affect start-up time.' 'DarkGray' }
     foreach ($c in $changes) { & $add ('  {0,-8} {1,-15} {2}{3}' -f $c.Action, $c.Category, $c.Name, $(if ($c.Undone) { '   (undone later)' } else { '' })) $(if ($c.Action -eq 'Delete') { 'Red' } else { 'Yellow' }) }
@@ -1985,6 +2120,86 @@ function Write-PssRule([string]$Title = '', [string]$Color = 'DarkCyan') {
     } else { Write-Host ('  ' + ($h * ($w - 2))) -ForegroundColor $Color }
 }
 
+# ---- PD header ---------------------------------------------------------------------------------------------------
+# The PD logo beside the tool's name, shown once when a pxdtek CLI tool starts. The master copy is cli/PdHeader.ps1
+# in the pxdtek repo; each tool carries a copy (they run through irm | iex, so they can't load it). Keep them in sync.
+# ASCII-only on purpose, so irm | iex never trips on encoding: the solid-block logo is stored as letters
+# (U = upper half block, D = lower half block, F = full block) and turned into blocks when it's shown.
+# Each run picks one of the two logos at random; a window too narrow for the logo gets a one-line header.
+function Show-PdHeader {
+    param([string]$Name, [string]$Version = '', [string[]]$About = @(), [string]$Command = '')
+    $ascii = @(
+        '      -++++++++++-'
+        '   :++-          -++:'
+        '  ++        +#-     ++'
+        ' #-         -+@%-    -#'
+        '++    =##*%#%=-=##.   ++'
+        '%    +%. .@:+%   *#    %'
+        '%    #*   %+:@. .%+    %'
+        '++   .##=-=%#%*##=    ++'
+        ' #-    -%@+-         -#'
+        '  ++     -#+        ++'
+        '   :++-          -++:'
+        '      -++++++++++-'
+    )
+    $blocks = @(
+        '      DDDUUUUUUDDD'
+        '    DUU          UUD'
+        '  DU        UFD     UD'
+        ' FU         DDFFD    UF'
+        'DU    DFUUFFFU UUF    UD'
+        'F    DF   F UF   FF    F'
+        'F    FF   FD F   FU    F'
+        'UD    FDD DFFFDDFU    DU'
+        ' FD    UFFUU         DF'
+        '  UD     UFD        DU'
+        '    UDD          DDU'
+        '      UUUDDDDDDUUU'
+    )
+    $text = New-Object System.Collections.Generic.List[object]
+    $text.Add(@($Name, 'White'))
+    $text.Add(@(((@($Version, 'pxdtek.com') | Where-Object { $_ }) -join '  -  '), 'DarkGray'))
+    if ($About) { $text.Add(@('', 'Gray')); foreach ($a in $About) { $text.Add(@($a, 'Gray')) } }
+    if ($Command) { $text.Add(@('', 'Gray')); $text.Add(@($Command, 'DarkCyan')) }
+    $textWidth = ($text | ForEach-Object { $_[0].Length } | Measure-Object -Maximum).Maximum
+
+    $w = 0
+    try { $w = $Host.UI.RawUI.WindowSize.Width } catch {}
+    Write-Host ''
+    if ($w -gt 0 -and $w -lt 30 + $textWidth) {
+        Write-Host '  (pd) ' -NoNewline -ForegroundColor Cyan
+        Write-Host $Name -NoNewline -ForegroundColor White
+        Write-Host $(if ($Version) { "  $Version" } else { '' }) -ForegroundColor DarkGray
+        Write-Host ''
+        return
+    }
+
+    if ($null -eq (Get-Variable -Name PdHeaderStyle -Scope Script -ValueOnly -ErrorAction SilentlyContinue)) { $script:PdHeaderStyle = Get-Random -Minimum 0 -Maximum 2 }
+    $useBlocks = $script:PdHeaderStyle -eq 1
+    $top = [Math]::Max(0, [Math]::Floor(($ascii.Count - $text.Count) / 2))
+    for ($i = 0; $i -lt $ascii.Count; $i++) {
+        Write-Host '  ' -NoNewline
+        if ($useBlocks) {
+            $l = $blocks[$i].Replace('U', [string][char]0x2580).Replace('D', [string][char]0x2584).Replace('F', [string][char]0x2588)
+            Write-Host $l.PadRight(24) -NoNewline -ForegroundColor Cyan
+        } else {
+            # dense strokes white, the middle cyan, the edges dark cyan: one colour run at a time
+            $run = ''; $col = ''
+            foreach ($c in $ascii[$i].PadRight(24).ToCharArray()) {
+                $k = if ('@%#'.Contains([string]$c)) { 'White' } elseif ('*+='.Contains([string]$c)) { 'Cyan' } else { 'DarkCyan' }
+                if ($k -ne $col -and $run) { Write-Host $run -NoNewline -ForegroundColor $col; $run = '' }
+                $col = $k; $run += $c
+            }
+            if ($run) { Write-Host $run -NoNewline -ForegroundColor $col }
+        }
+        $j = $i - $top
+        if ($j -ge 0 -and $j -lt $text.Count -and $text[$j][0]) { Write-Host ('    ' + $text[$j][0]) -NoNewline -ForegroundColor $text[$j][1] }
+        Write-Host ''
+    }
+    Write-Host ''
+}
+# ---- end of PD header --------------------------------------------------------------------------------------------
+
 function Write-PssHeader($Scan) {
     try { Clear-Host 2>$null } catch {}
     $w = Get-PssWidth
@@ -1992,8 +2207,8 @@ function Write-PssHeader($Scan) {
     $inner = [Math]::Min($w - 4, 100)
     Write-Host ''
     Write-Host ('  ' + [char]0x2554 + ($h * $inner) + [char]0x2557) -ForegroundColor DarkCyan
-    $t1 = "  PAX STARTUP SCANNER  v$($script:PssVersion)"
-    $t2 = if ($script:PssReadOnly) { 'READ-ONLY  -  IT diagnostics  ' } else { 'IT diagnostics  ' }
+    $t1 = "  pxd STARTUP SCANNER  v$($script:PssVersion)"
+    $t2 = if ($script:PssReadOnly) { 'READ-ONLY  -  IT diagnostics  ' } elseif ($script:PssInMemory) { 'IN-MEMORY  -  IT diagnostics  ' } else { 'IT diagnostics  ' }
     Write-Host ('  ' + [char]0x2551) -NoNewline -ForegroundColor DarkCyan
     Write-Host $t1 -NoNewline -ForegroundColor White
     Write-Host ($t2.PadLeft($inner - $t1.Length)) -NoNewline -ForegroundColor DarkGray
@@ -2157,7 +2372,7 @@ function Show-PssDetails($Scan, [int]$Id) {
             Write-Host '   ' -NoNewline
             if ($it.CanDisable) { Write-Host ('[D] ' + $(if ($it.Enabled) { 'Disable at startup' } else { 'Enable at startup' }) + '   ') -NoNewline -ForegroundColor Yellow }
             if ($it.CanDelete) { Write-Host '[X] Delete entry   ' -NoNewline -ForegroundColor Red }
-            Write-Host 'Backups and Undo: [U] in the main menu' -ForegroundColor DarkGray
+            Write-Host $(if ($script:PssInMemory) { 'In-memory mode: no backups, no Undo' } else { 'Backups and Undo: [U] in the main menu' }) -ForegroundColor DarkGray
         }
         Write-Host '   > ' -NoNewline -ForegroundColor Cyan
         $k = Read-PssKey
@@ -2169,16 +2384,19 @@ function Show-PssDetails($Scan, [int]$Id) {
                     $why = if ($it.ActionNote) { $it.ActionNote } elseif ($action -eq 'Delete') { "This entry can't be deleted here." } else { "This entry can't be disabled, only deleted." }
                     Write-Host "   $why" -ForegroundColor Yellow; Start-Sleep 2; break
                 }
-                # Disable/Enable are reversible and happen straight away; only Delete asks first
+                # Disable/Enable are reversible and happen straight away; only Delete asks first.
+                # In-memory mode keeps no backup, so every change asks first.
                 $go = $true
-                if ($action -eq 'Delete') {
+                if ($action -eq 'Delete' -or $script:PssInMemory) {
                     Write-Host ''
                     $lines = (Get-PssConfirmText $it $action) -split "`n"
                     Write-Host "   $($lines[0])" -ForegroundColor Red
-                    foreach ($l in ($lines | Select-Object -Skip 1)) { Write-Host "   $l" -ForegroundColor Gray }
+                    foreach ($l in ($lines | Select-Object -Skip 1)) { Write-Host "   $l" -ForegroundColor $(if ($l -like 'In-memory mode:*') { 'Yellow' } else { 'Gray' }) }
                     Write-Host ''
-                    Write-Host '   Type Y to confirm > ' -NoNewline -ForegroundColor Cyan
+                    if ($script:PssInMemory) { Write-Host "   In-memory mode: this change has no backup and can't be undone from here. Continue? (y/N) > " -NoNewline -ForegroundColor Yellow }
+                    else { Write-Host '   Type Y to confirm > ' -NoNewline -ForegroundColor Cyan }
                     $go = (Read-PssKey) -match '^(?i)y(es)?$'
+                    if (-not $go -and $script:PssInMemory) { Write-Host '   Nothing was changed.' -ForegroundColor DarkGray; Start-Sleep -Milliseconds 800 }
                 }
                 if ($go) {
                     $res = Invoke-PssChange $it $action
@@ -2261,7 +2479,8 @@ function Show-PssGroups($Scan, [string]$Property, [string]$Title, [string]$Label
 
 function Write-PssBootTests {
     # The timed restarts table; returns the tests (newest first)
-    Write-PssRule 'Boot tests (restarts timed by PAX Startup Scanner)'
+    Write-PssRule 'Boot tests (restarts timed by pxd Startup Scanner)'
+    if ($script:PssInMemory) { Write-Host '   In-memory mode: boot tests are not available (they need files and scheduled tasks on this PC).' -ForegroundColor Yellow }
     $state = Get-PssBootTestState
     if ($state) { Write-Host ("   Ready: '{0}'. Restart the PC and sign in to run it ([C] cancels it)." -f $state.Label) -ForegroundColor Yellow }
     $tests = @(Get-PssBootTests)
@@ -2385,7 +2604,7 @@ function Write-PssBootLog($Scan) {
 function Invoke-PssExportPrompt($Scan) {
     if ($script:PssReadOnly) { Write-Host '   Read-only mode: reports are not saved. Run without -ReadOnly to export.' -ForegroundColor Yellow; Start-Sleep 2; return }
     $desk = [Environment]::GetFolderPath('Desktop')
-    $def = Join-Path $desk ('PAX-Startup-{0}-{1:yyyyMMdd-HHmm}.html' -f $Scan.Computer, $Scan.ScannedAt)
+    $def = Join-Path $desk ('pxd-Startup-{0}-{1:yyyyMMdd-HHmm}.html' -f $Scan.Computer, $Scan.ScannedAt)
     Write-Host ''
     Write-Host "   Save report as (.html .csv .json)" -ForegroundColor Gray
     Write-Host "   [$def]" -ForegroundColor DarkGray
@@ -2432,9 +2651,14 @@ function Show-PssBackupMenu($Scan) {
         Write-Host '   Over a remote session, copy it to the clipboard and paste it into a text file on your own PC.' -ForegroundColor DarkGray
         Write-Host ''
         Write-Host '   [1] Save a backup to a file   [2] Copy a backup to the clipboard' -ForegroundColor Cyan
-        Write-Host '   [3] Restore from a file       [4] Restore from the clipboard       [Enter] Back' -ForegroundColor Cyan
+        if ($script:PssInMemory) {
+            # Saving where the user picks is fine; restoring writes undo backups on this PC, so it is off here
+            Write-Host '   In-memory mode: restoring is not available; registry-key entries are left out of the backup.' -ForegroundColor Yellow
+            Write-Host '   [Enter] Back' -ForegroundColor Cyan
+        } else { Write-Host '   [3] Restore from a file       [4] Restore from the clipboard       [Enter] Back' -ForegroundColor Cyan }
         Write-Host '   > ' -NoNewline -ForegroundColor Cyan
         $k = Read-PssKey
+        if ($script:PssInMemory -and $k -match '^[34]$') { $k = '' }
         switch -Regex ($k) {
             '^[12]$' {
                 if ($k -eq '1' -and $script:PssReadOnly) { Write-Host '   Read-only mode: no files are written. Use [2] to copy it to the clipboard instead.' -ForegroundColor Yellow; Start-Sleep 2; break }
@@ -2442,7 +2666,7 @@ function Show-PssBackupMenu($Scan) {
                 $json = New-PssSnapshot $Scan
                 $n = ($json | ConvertFrom-Json).Count
                 if ($k -eq '1') {
-                    $def = Join-Path ([Environment]::GetFolderPath('Desktop')) ('PAX-Startup-Backup-{0}-{1:yyyyMMdd-HHmm}.json' -f $env:COMPUTERNAME, (Get-Date))
+                    $def = Join-Path ([Environment]::GetFolderPath('Desktop')) ('pxd-Startup-Backup-{0}-{1:yyyyMMdd-HHmm}.json' -f $env:COMPUTERNAME, (Get-Date))
                     Write-Host "   Save as [$def] > " -NoNewline -ForegroundColor Cyan
                     $p = Read-PssKey; if (-not $p) { $p = $def }
                     try { [IO.File]::WriteAllText($p, $json, (New-Object Text.UTF8Encoding $false)); Write-Host ("   Saved {0} entries ({1:N0} KB) to {2}" -f $n, ($json.Length / 1KB), $p) -ForegroundColor Green }
@@ -2481,6 +2705,11 @@ function Show-PssBackupMenu($Scan) {
 
 function Show-PssUndo($Scan) {
     # Lists saved changes; returns $true when something was restored (so the caller can rescan)
+    if ($script:PssInMemory) {
+        Write-Host '   In-memory mode: Undo is not available. Nothing is saved on this PC, so changes made here have no backup.' -ForegroundColor Yellow
+        Write-Host '   Press Enter to go back > ' -NoNewline -ForegroundColor Cyan; $null = Read-PssKey
+        return $false
+    }
     $restored = $false
     while ($true) {
         Write-PssHeader $Scan
@@ -2622,11 +2851,11 @@ function Set-PssAppId {
     if (-not ('Pss.Shell' -as [type])) {
         Add-Type -Namespace Pss -Name Shell -MemberDefinition '[System.Runtime.InteropServices.DllImport("shell32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)] public static extern int SetCurrentProcessExplicitAppUserModelID(string appId);'
     }
-    [void][Pss.Shell]::SetCurrentProcessExplicitAppUserModelID('Pax.StartupScanner')
+    [void][Pss.Shell]::SetCurrentProcessExplicitAppUserModelID('pxd.StartupScanner')
 }
 
-# ---- PAX App Standard: own title bar on every window, remembered window placement ----
-$script:PssAppId = 'PaxStartupScanner'
+# ---- pxd App Standard: own title bar on every window, remembered window placement ----
+# ($script:PssAppId, the app id, is set at the top of the script)
 $script:PssGlyphMax = 'M0.5,0.5 L9.5,0.5 L9.5,9.5 L0.5,9.5 Z'
 $script:PssGlyphRestore = 'M2.5,0.5 L9.5,0.5 L9.5,7.5 M0.5,2.5 L7.5,2.5 L7.5,9.5 L0.5,9.5 Z'
 
@@ -2662,7 +2891,7 @@ function Get-PssChromeXaml([switch]$Styles, [switch]$Resizable, [switch]$NoMinim
   <Grid Height="38" Background="#0A0D12">
     <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="12,0,0,0">
       <Image x:Name="TitleIcon" Width="18" Height="18" Margin="0,0,9,0" RenderOptions.BitmapScalingMode="HighQuality"/>
-      <TextBlock x:Name="TitleText" Text="PAX Startup Scanner" FontSize="12.5" FontWeight="SemiBold" Foreground="#C9CED9" VerticalAlignment="Center"/>
+      <TextBlock x:Name="TitleText" Text="pxd Startup Scanner" FontSize="12.5" FontWeight="SemiBold" Foreground="#C9CED9" VerticalAlignment="Center"/>
       <TextBlock x:Name="TitleVer" FontSize="12" Foreground="#6B7385" Margin="8,0,0,0" VerticalAlignment="Center"/>
     </StackPanel>
     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Top">
@@ -2704,7 +2933,14 @@ function Initialize-PssChrome($Win) {
 function Get-PssConfigDir {
     # Per-user settings (window placement). $env:PSS_CONFIG_DIR points it elsewhere (tests).
     if ($env:PSS_CONFIG_DIR) { return $env:PSS_CONFIG_DIR }
-    return (Join-Path ([Environment]::GetFolderPath('ApplicationData')) $script:PssAppId)
+    $app = [Environment]::GetFolderPath('ApplicationData')
+    $new = Join-Path $app $script:PssAppId
+    if (-not (Test-Path -LiteralPath $new)) {
+        # read-only mode doesn't migrate, so it reads an older version's folder (migration: former name)
+        $old = Join-Path $app (Get-PssFormerName $script:PssAppId)
+        if (Test-Path -LiteralPath $old) { return $old }
+    }
+    return $new
 }
 
 function Get-PssScreens {
@@ -2747,7 +2983,7 @@ function Read-PssPlacement {
 
 function Save-PssPlacement($Win) {
     # Read-only mode writes nothing, so the placement is not saved there
-    if ($script:PssReadOnly) { return $false }
+    if ($script:PssReadOnly -or $script:PssInMemory) { return $false }
     try {
         $b = $Win.RestoreBounds
         if ($Win.WindowState -eq 'Normal' -or $b.IsEmpty) { $b = New-Object Windows.Rect $Win.Left, $Win.Top, $Win.Width, $Win.Height }
@@ -2806,7 +3042,7 @@ function Show-PssMessage($Owner, [string]$Text, [string]$Buttons = 'OK', [string
     $btnXaml = if ($Buttons -eq 'YesNo') { '<Button x:Name="BtnA" IsDefault="True" Tag="Yes">Yes</Button><Button x:Name="BtnB" IsCancel="True" Tag="No" Margin="0">No</Button>' } else { '<Button x:Name="BtnA" IsDefault="True" IsCancel="True" Tag="OK" Margin="0">OK</Button>' }
     $xamlText = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="PAX Startup Scanner" SizeToContent="WidthAndHeight" MinWidth="380" ResizeMode="NoResize" WindowStyle="None" ShowInTaskbar="False"
+        Title="pxd Startup Scanner" SizeToContent="WidthAndHeight" MinWidth="380" ResizeMode="NoResize" WindowStyle="None" ShowInTaskbar="False"
         Background="#0F1115" Foreground="#E6E8EE" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
   <WindowChrome.WindowChrome>
     <WindowChrome CaptionHeight="38" ResizeBorderThickness="0" GlassFrameThickness="0,0,0,1" CornerRadius="0" UseAeroCaptionButtons="False"/>
@@ -2863,7 +3099,7 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
 
     $xamlText = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="PAX Startup Scanner" Width="1280" Height="800" MinWidth="900" MinHeight="560" WindowStartupLocation="CenterScreen"
+        Title="pxd Startup Scanner" Width="1280" Height="800" MinWidth="900" MinHeight="560" WindowStartupLocation="CenterScreen"
         WindowStyle="None" ResizeMode="CanResize"
         Background="#0F1115" Foreground="#E6E8EE" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
   <WindowChrome.WindowChrome>
@@ -3127,15 +3363,15 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
 '@
     [xml]$xaml = $xamlText.Replace('%STYLES%', (Get-PssChromeXaml -Styles)).Replace('%TITLEBAR%', (Get-PssChromeXaml -Resizable))
     $win = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
-    # Own title bar (PAX App Standard): caption buttons, maximized padding, own icon for the title bar,
+    # Own title bar (pxd App Standard): caption buttons, maximized padding, own icon for the title bar,
     # Alt+Tab and the taskbar instead of PowerShell's
     Initialize-PssChrome $win
     try {
         $win.Icon = New-PssIcon 256
         # (compiling the small taskbar helper writes temp files, so read-only mode skips it)
-        if (-not $Snapshot -and -not $script:PssReadOnly) { Set-PssAppId }
+        if (-not $Snapshot -and -not $script:PssReadOnly -and -not $script:PssInMemory) { Set-PssAppId }
     } catch {}
-    $win.FindName('TitleVer').Text = "v$($script:PssVersion)" + $(if ($script:PssReadOnly) { '  -  read-only' } else { '' })
+    $win.FindName('TitleVer').Text = "v$($script:PssVersion)" + $(if ($script:PssReadOnly) { '  -  read-only' } elseif ($script:PssInMemory) { '  -  in-memory' } else { '' })
     $ui = @{}
     foreach ($n in 'SubTitle', 'Tiles', 'Search', 'SearchHint', 'HideMs', 'BtnClear', 'Facets', 'BootTestTab', 'BtLabel', 'BtnBtArm', 'BtnBtCancel', 'BtnBtRestart', 'BtState', 'BtnBtRefresh', 'BtGrid', 'BtnBtCompare', 'BtCompare', 'BtnExport', 'BtnBackup', 'BtnRescan', 'Banner', 'Grid', 'Detail', 'BtnLoc', 'BtnFile', 'BtnVt', 'BtnWeb', 'BtnCopy', 'BtnToggle', 'BtnDelete', 'BootGrid', 'DelayGrid', 'Tabs', 'UndoTab', 'UndoNote', 'UndoGrid', 'BtnUndoSel', 'BtnUndoFolder', 'BtnUndoRefresh', 'Status') { $ui[$n] = $win.FindName($n) }
     $state = @{ Scan = $Scan; Job = $null }
@@ -3243,6 +3479,10 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
         $st = Get-PssBootTestState
         $ui.BtState.Text = $(if ($st) { "Ready: '$($st.Label)'. Restart and sign in to run it." } else { '' })
         $ui.BtnBtCancel.IsEnabled = [bool]$st
+        if ($script:PssInMemory) {
+            $ui.BtState.Text = 'In-memory mode: boot tests are not available (they need files and scheduled tasks on this PC).'
+            $ui.BtnBtArm.IsEnabled = $false; $ui.BtnBtCancel.IsEnabled = $false; $ui.BtnBtRestart.IsEnabled = $false
+        }
         if (-not $ui.BtLabel.Text) { $ui.BtLabel.Text = $(if ($tests) { 'After changes' } else { 'Before changes' }) }
         $ui.BootTestTab.Header = $(if ($tests) { "Boot tests ($($tests.Count))" } else { 'Boot tests' })
     }
@@ -3316,6 +3556,7 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
         [void]$ui.Tiles.Children.Add((& $makeTile $(if ($s.Boot.LastBootMs) { '{0:N1}s' -f ($s.Boot.LastBootMs / 1000) } else { 'n/a' }) $(if ($s.Boot.LastBootTime) { 'last boot, {0:MMM d}' -f $s.Boot.LastBootTime } else { 'last boot' }) '#38BDF8'))
         $notes = @()
         if ($script:PssReadOnly) { $notes += 'Read-only mode: nothing on this PC is written or changed (Disable, Delete, Undo, boot tests and export are off).' }
+        elseif ($script:PssInMemory) { $notes += "In-memory: nothing is saved on this PC. Disable and Delete have no backup and can't be undone here; Undo and boot tests are off." }
         if (-not $s.IsAdmin) { $notes += 'Not elevated: services, tasks, WMI and boot history may be incomplete. Run from an elevated PowerShell for full results.' }
         if ($s.NotLoadedProfiles) { $notes += 'Users not logged on (Run keys not read): ' + ($s.NotLoadedProfiles -join ', ') }
         $notes += $s.Errors
@@ -3357,7 +3598,7 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
         if ($script:PssReadOnly) { $ui.Status.Text = 'Read-only mode: reports are not saved. Copy details instead, or run without -ReadOnly.'; return }
         $d = New-Object Microsoft.Win32.SaveFileDialog
         $d.Filter = 'HTML report|*.html|CSV|*.csv|JSON|*.json'
-        $d.FileName = 'PAX-Startup-{0}-{1:yyyyMMdd-HHmm}' -f $state.Scan.Computer, $state.Scan.ScannedAt
+        $d.FileName = 'pxd-Startup-{0}-{1:yyyyMMdd-HHmm}' -f $state.Scan.Computer, $state.Scan.ScannedAt
         if (-not $d.ShowDialog($win)) { return }
         $out = $state.Scan; $note = ''
         if ($ShownOnly) {
@@ -3389,8 +3630,8 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
             return
         }
         $d = New-Object Microsoft.Win32.SaveFileDialog
-        $d.Filter = 'PAX Startup Scanner backup|*.json'
-        $d.FileName = 'PAX-Startup-Backup-{0}-{1:yyyyMMdd-HHmm}' -f $env:COMPUTERNAME, (Get-Date)
+        $d.Filter = 'pxd Startup Scanner backup|*.json'
+        $d.FileName = 'pxd-Startup-Backup-{0}-{1:yyyyMMdd-HHmm}' -f $env:COMPUTERNAME, (Get-Date)
         if (-not $d.ShowDialog($win)) { return }
         try { [IO.File]::WriteAllText($d.FileName, $json, (New-Object Text.UTF8Encoding $false)); $ui.Status.Text = "Saved a backup of $n startup entries to $($d.FileName)" }
         catch { [void](Show-PssMessage $win "Could not save: $($_.Exception.Message)" 'OK' 'Error') }
@@ -3401,7 +3642,7 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
             if ($Clipboard) { $snap = Read-PssSnapshot ([Windows.Clipboard]::GetText()) }
             else {
                 $d = New-Object Microsoft.Win32.OpenFileDialog
-                $d.Filter = 'PAX Startup Scanner backup|*.json|All files|*.*'
+                $d.Filter = 'pxd Startup Scanner backup|*.json|All files|*.*'
                 if (-not $d.ShowDialog($win)) { return }
                 $snap = Read-PssSnapshot ([IO.File]::ReadAllText($d.FileName))
             }
@@ -3426,23 +3667,33 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
             )
             foreach ($i in $items) {
                 if (-not $i) { [void]$m.Items.Add((New-Object Windows.Controls.Separator)); continue }
-                $mi = New-Object Windows.Controls.MenuItem; $mi.Header = $i[0]; $mi.Add_Click($i[1]); [void]$m.Items.Add($mi)
+                $mi = New-Object Windows.Controls.MenuItem; $mi.Header = $i[0]; $mi.Add_Click($i[1])
+                # in-memory mode: restoring writes undo backups on this PC, so it is off
+                if ($script:PssInMemory -and $i[0] -like 'Restore*') { $mi.IsEnabled = $false; $mi.Header = $i[0] + '  (not in in-memory mode)' }
+                [void]$m.Items.Add($mi)
             }
             $m.PlacementTarget = $ui.BtnBackup; $m.Placement = 'Bottom'; $m.IsOpen = $true
         })
 
     $loadUndo = {
+        if ($script:PssInMemory) {
+            $ui.UndoGrid.ItemsSource = @(); $ui.UndoTab.Header = 'Undo changes'
+            $ui.UndoNote.Text = "In-memory mode: Undo is not available. Nothing is saved on this PC, so Disable, Enable and Delete made here have no backup."
+            $ui.BtnUndoSel.IsEnabled = $false; $ui.BtnUndoFolder.IsEnabled = $false; $ui.BtnUndoRefresh.IsEnabled = $false
+            return
+        }
         $recs = @(Get-PssUndoRecords)
         $ui.UndoGrid.ItemsSource = $recs
         $ui.UndoTab.Header = $(if ($recs.Count) { "Undo changes ($($recs.Count))" } else { 'Undo changes' })
-        $ui.UndoNote.Text = "Every Disable, Enable and Delete made with PAX Startup Scanner on this PC is backed up in $(Get-PssBackupPath). Pick one and choose Undo to put it back the way it was."
+        $ui.UndoNote.Text = "Every Disable, Enable and Delete made with pxd Startup Scanner on this PC is backed up in $(Get-PssBackupPath). Pick one and choose Undo to put it back the way it was."
         $ui.BtnUndoSel.IsEnabled = $false
     }
     $doChange = {
         param([string]$Action)
         $it = & $sel; if (-not $it) { return }
-        # Disable/Enable are reversible and happen straight away; only Delete asks first
-        if ($Action -eq 'Delete') {
+        # Disable/Enable are reversible and happen straight away; only Delete asks first.
+        # In-memory mode keeps no backup, so every change asks first.
+        if ($Action -eq 'Delete' -or $script:PssInMemory) {
             $answer = (Show-PssMessage $win (Get-PssConfirmText $it $Action) 'YesNo' 'Warning')
             if ([string]$answer -ne 'Yes') { return }
         }
@@ -3450,7 +3701,7 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
         if (-not $res.Ok) { [void](Show-PssMessage $win $res.Message 'OK' 'Error') }
         & $applyFilter
         if ($ui.Grid.Items.Contains($it)) { $ui.Grid.SelectedItem = $it; $ui.Grid.ScrollIntoView($it) }
-        $ui.Status.Text = $res.Message + $(if ($res.Ok -and $Action -ne 'Delete') { '  (Undo changes can reverse it.)' } else { '' })
+        $ui.Status.Text = $res.Message + $(if ($res.Ok -and $Action -ne 'Delete' -and -not $script:PssInMemory) { '  (Undo changes can reverse it.)' } else { '' })
         $ui.Detail.Text = Get-PssDetailText $it
         & $updateButtons
         & $loadUndo
@@ -3494,6 +3745,7 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
         $rs = [runspacefactory]::CreateRunspace($iss); $rs.Open()
         $rs.SessionStateProxy.SetVariable('PssVersion', $script:PssVersion)
         $rs.SessionStateProxy.SetVariable('PssReadOnly', [bool]$script:PssReadOnly)
+        foreach ($v in 'PssInMemory', 'PssAppId', 'PssFormerPrefix') { $rs.SessionStateProxy.SetVariable($v, (Get-Variable -Name $v -Scope Script -ValueOnly -ErrorAction SilentlyContinue)) }
         $ps = [powershell]::Create(); $ps.Runspace = $rs
         [void]$ps.AddScript('param($s) Invoke-PssScan -Status $s').AddArgument($sync)
         $state.Job = @{ PS = $ps; RS = $rs; Sync = $sync; Handle = $ps.BeginInvoke() }
@@ -3510,7 +3762,7 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
         $win.Width = [Math]::Max(1000, [Math]::Min(1500, $wa.Width * 0.92)); $win.Height = [Math]::Max(600, [Math]::Min(940, $wa.Height * 0.92))
     } catch {}
     # Back where it was last time (size, position, maximized), unless that spot is on no screen now;
-    # saved to %APPDATA%\PaxStartupScanner\window.json on close (not in read-only mode)
+    # saved to %APPDATA%\pxdStartupScanner\window.json on close (not in read-only mode)
     if (-not $Snapshot) {
         [void](Restore-PssPlacement $win)
         $win.Add_Closing({ [void](Save-PssPlacement $win) })
@@ -3549,13 +3801,16 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
 #  Entry point
 # ======================================================================================
 
-function Start-PaxStartupScanner {
+function Start-pxdStartupScanner {
     param([switch]$Gui, [switch]$Report, [string]$Export, [switch]$ReadOnly)
     # Run the same way whatever the technician's profile sets (these only apply inside this call)
     Set-StrictMode -Off
     $ErrorActionPreference = 'Continue'
     $ProgressPreference = 'SilentlyContinue'
     $script:PssReadOnly = [bool]$ReadOnly -or $env:PSS_READONLY -in '1', 'true', 'yes'
+    # In-memory mode (set by the pxd Toolkit console while it runs this script): nothing is saved on the PC by the
+    # scanner itself (no settings, backups, migration, boot tests, taskbar id). Changes still work, without undo.
+    $script:PssInMemory = $env:PXD_INMEMORY -eq '1'
     $script:PssEof = $false
     $script:PssShowMicrosoft = $false
     $script:PssOnlyEnabled = $false
@@ -3564,7 +3819,13 @@ function Start-PaxStartupScanner {
         return
     }
     $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    Write-PssHeader $null
+    # Data an older version kept under its former name moves across before anything reads it
+    # (in-memory mode moves nothing)
+    if (-not $script:PssInMemory) { [void](Invoke-PssMigration -IsAdmin $isAdmin) }
+    # The PD logo while the first scan runs (the boxed header takes over on the next screen); reports keep the box.
+    if ($Report -or $Export) { Write-PssHeader $null }
+    else { try { Clear-Host 2>$null } catch {}; Show-PdHeader -Name 'pxd Startup Scanner' -Version "v$($script:PssVersion)" -Command 'irm pxdtek.com/ss|iex' }
+    if ($script:PssInMemory) { Write-Host '   In-memory: nothing is saved on this PC.' -ForegroundColor DarkGray }
     if (-not $isAdmin) { Write-Host '   Not running elevated - some areas (services, tasks, WMI, boot history) will be incomplete.' -ForegroundColor Yellow }
     $scan = Invoke-PssConsoleScan
     if ($Export) {
@@ -3582,4 +3843,4 @@ function Start-PaxStartupScanner {
     Start-PssConsole $scan
 }
 
-Start-PaxStartupScanner -Gui:$Gui -Report:$Report -Export $Export -ReadOnly:$ReadOnly
+Start-pxdStartupScanner -Gui:$Gui -Report:$Report -Export $Export -ReadOnly:$ReadOnly

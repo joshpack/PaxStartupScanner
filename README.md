@@ -1,10 +1,10 @@
-# <img src="docs/icon.png" width="44" align="top" alt=""> PAX Startup Scanner
+# <img src="docs/icon.png" width="44" align="top" alt=""> pxd Startup Scanner
 
 Finds everything that starts with Windows: what each item is, where it lives, who signed it, whether it looks suspicious, and what is slowing the machine down. You can filter the results by status, risk, category, publisher, signature and more. You can disable or delete what shouldn't be there, and every change is backed up and can be undone. You can also time a restart before and after your changes to see whether they helped.
 
 It is one PowerShell script with nothing to install, so you can run it straight from GitHub on any machine you are fixing.
 
-It works with [PAX Toolkit](https://github.com/joshpack/PaxToolkit): it can be turned on and run from there.
+It works with [pxd Toolkit](https://github.com/joshpack/pxdToolkit): it can be turned on and run from there.
 
 ![Console dashboard](docs/screenshots/console-dashboard.png)
 
@@ -13,31 +13,33 @@ It works with [PAX Toolkit](https://github.com/joshpack/PaxToolkit): it can be t
 Open **PowerShell as Administrator** and type:
 
 ```powershell
-irm paxdigi.com/startup | iex
+irm pxdtek.com/ss | iex
 ```
 
-`irm` downloads the script and `iex` runs it. The short address forwards to the script on GitHub, so it always gets the latest version. The full address works too:
+`irm` downloads the script and `iex` runs it. pxdtek.com serves the script from GitHub, so it always gets the latest version. The full address works too:
 
 ```powershell
-irm https://raw.githubusercontent.com/joshpack/PaxStartupScanner/main/PaxStartupScanner.ps1 | iex
+irm https://raw.githubusercontent.com/joshpack/pxdStartupScanner/main/pxdStartupScanner.ps1 | iex
 ```
 
 That's it. The script runs in memory and installs nothing. It writes files only for things you choose to do:
 - backups of changes (see [Removing startup items](#removing-startup-items))
 - boot tests (see [Boot tests](#boot-tests))
 - reports you export
-- the GUI window's size and position, in `%APPDATA%\PaxStartupScanner\window.json`
+- the GUI window's size and position, in `%APPDATA%\pxdStartupScanner\window.json`
 
 To guarantee it writes nothing at all, use read-only mode:
 
 ```powershell
-$env:PSS_READONLY = '1'; irm https://raw.githubusercontent.com/joshpack/PaxStartupScanner/main/PaxStartupScanner.ps1 | iex
+$env:PSS_READONLY = '1'; irm https://raw.githubusercontent.com/joshpack/pxdStartupScanner/main/pxdStartupScanner.ps1 | iex
 ```
+
+**In-memory mode.** When the [pxd Toolkit](https://github.com/joshpack/pxdToolkit) console (`irm pxdtek.com/tk | iex`) runs the scanner, it sets `$env:PXD_INMEMORY = '1'`. The scanner then saves nothing on the PC by itself: no window settings, no backups, no boot tests, no taskbar id, and older versions' folders aren't moved. Disable and Delete still work, but each one asks first because it has no backup and can't be undone from here. Undo, restoring a full backup and boot tests are off. Reports and backups you save yourself are written only where you choose.
 
 On older systems where PowerShell doesn't use TLS 1.2 by default (Server 2012 R2/2016, early Windows 10), use:
 
 ```powershell
-[Net.ServicePointManager]::SecurityProtocol = 'Tls12'; irm https://raw.githubusercontent.com/joshpack/PaxStartupScanner/main/PaxStartupScanner.ps1 | iex
+[Net.ServicePointManager]::SecurityProtocol = 'Tls12'; irm https://raw.githubusercontent.com/joshpack/pxdStartupScanner/main/pxdStartupScanner.ps1 | iex
 ```
 
 ### Options
@@ -46,10 +48,10 @@ On older systems where PowerShell doesn't use TLS 1.2 by default (Server 2012 R2
 
 ```powershell
 # Open the graphical view
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/joshpack/PaxStartupScanner/main/PaxStartupScanner.ps1))) -Gui
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/joshpack/pxdStartupScanner/main/pxdStartupScanner.ps1))) -Gui
 
 # Non-interactive: print the summary + flagged items, save a report, and return
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/joshpack/PaxStartupScanner/main/PaxStartupScanner.ps1))) -Report -Export C:\Temp\startup.html
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/joshpack/pxdStartupScanner/main/pxdStartupScanner.ps1))) -Report -Export C:\Temp\startup.html
 ```
 
 | Parameter | What it does |
@@ -59,7 +61,7 @@ On older systems where PowerShell doesn't use TLS 1.2 by default (Server 2012 R2
 | `-Export <path>` | Saves a report after scanning. Use `.html` (self-contained, filterable), `.csv` or `.json` |
 | `-ReadOnly` | Look only. Nothing on the PC is written or changed (same as `$env:PSS_READONLY = '1'`) |
 
-A downloaded copy runs the same way: `powershell -ExecutionPolicy Bypass -File .\PaxStartupScanner.ps1`
+A downloaded copy runs the same way: `powershell -ExecutionPolicy Bypass -File .\pxdStartupScanner.ps1`
 
 ## Using the console
 
@@ -125,7 +127,7 @@ Other ways to narrow things down:
 
 The details pane has **Disable** and **Delete** buttons. Hover over a greyed-out button to see why that item can't be changed. Rescans run in the background, so the window stays responsive.
 
-The window has its own dark title bar, like every PAX app: drag it to move, double-click to maximize, and Windows snap and edge resizing still work. Questions and errors use the same style. The window opens where you left it last time (size, position and maximized), unless that spot is no longer on any screen.
+The window has its own dark title bar, like every pxd app: drag it to move, double-click to maximize, and Windows snap and edge resizing still work. Questions and errors use the same style. The window opens where you left it last time (size, position and maximized), unless that spot is no longer on any screen.
 
 ![GUI](docs/screenshots/gui.png)
 
@@ -150,7 +152,7 @@ To see whether your changes actually made Windows start faster:
 
 How the timing works:
 - It needs an elevated PowerShell.
-- It uses two one-time scheduled tasks under `\PAX Startup Scanner\`. They run a small probe saved at `C:\ProgramData\PaxStartupScanner\boot-probe.ps1`, write the result to `C:\ProgramData\PaxStartupScanner\BootTests`, then remove the tasks and the probe.
+- It uses two one-time scheduled tasks under `\pxd Startup Scanner\`. They run a small probe saved at `C:\ProgramData\pxdStartupScanner\boot-probe.ps1`, write the result to `C:\ProgramData\pxdStartupScanner\BootTests`, then remove the tasks and the probe.
 - You can cancel a test that hasn't run yet.
 - Start-up times naturally vary by a few seconds, so time two or three restarts each way for a fair comparison.
 
@@ -192,9 +194,11 @@ You can keep it in two ways:
 
 **Restore from a file** or **Restore from the clipboard** puts everything back the way it was when the backup was taken. Entries added since are left alone. You get a warning if the backup came from a different PC. In read-only mode you can still copy a backup to the clipboard, but saving and restoring are off. Protected Windows parts and WMI subscriptions aren't included, since the scanner never changes them.
 
-**Backups and Undo.** Before anything is changed, a record of the old state is written to `C:\ProgramData\PaxStartupScanner\Backups`. If the change fails, the record is removed again. **Undo** (`U` in the console, the **Undo changes** tab in the GUI) lists every change made on that PC and puts it back. Restored records move to `Backups\Restored`. Two exceptions:
+**Backups and Undo.** Before anything is changed, a record of the old state is written to `C:\ProgramData\pxdStartupScanner\Backups`. If the change fails, the record is removed again. **Undo** (`U` in the console, the **Undo changes** tab in the GUI) lists every change made on that PC and puts it back. Restored records move to `Backups\Restored`. Two exceptions:
 - **WMI subscriptions** aren't recreated automatically. Their definition is saved for reference.
 - **Restoring a deleted scheduled task** needs the ScheduledTasks module, which ships with Windows 8 / Server 2012 and later.
+
+**Coming from an older version.** Before 1.6.0 the scanner had another name. The first time 1.6.0 runs, it moves that version's settings folder to `%APPDATA%\pxdStartupScanner` and, when it runs elevated, its backups and boot tests to `C:\ProgramData\pxdStartupScanner`. A boot test that was already armed is re-armed under `\pxd Startup Scanner\`. Until that elevated run the old folder stays in use, so Undo still finds every change. Full backups saved by older versions can still be restored.
 
 **What's protected.** These can't be changed from the scanner:
 - clean Microsoft services and drivers
