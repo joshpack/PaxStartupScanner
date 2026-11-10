@@ -39,7 +39,7 @@ param(
     [switch]$ReadOnly
 )
 
-$script:PssVersion = '1.6.0'
+$script:PssVersion = '1.6.1'
 $script:PssAppId   = 'pxdStartupScanner'
 $script:PssUrl     = 'https://raw.githubusercontent.com/joshpack/pxdStartupScanner/main/pxdStartupScanner.ps1'
 $script:PssSelfPath = $PSCommandPath   # empty when run through irm | iex
@@ -3801,6 +3801,82 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
 #  Entry point
 # ======================================================================================
 
+# ---- Update before start (pxd standard rule 6) ------------------------------------------------------------------------
+# A copy run from a file (installed by the pxd Toolkit) checks the latest GitHub release first; when it's newer, the file
+# is replaced and the new copy runs with the same parameters. Through irm | iex the script is already the latest, and
+# in-memory or read-only mode writes nothing, so those don't check. PXD_NO_UPDATE=1 turns it off; PXD_UPDATE_API points
+# at another API server (tests). Never stops the scanner from starting: any problem just runs this copy.
+$script:PssRepo = 'joshpack/pxdStartupScanner'
+$script:PssAsset = '^pxdStartupScanner\.ps1$'
+
+function Get-PssVersionOf([string]$Text) {
+    $m = [regex]::Match([string]$Text, '(\d+)\.(\d+)(?:\.(\d+))?')
+    if (-not $m.Success) { return $null }
+    return New-Object Version ([int]$m.Groups[1].Value), ([int]$m.Groups[2].Value), $(if ($m.Groups[3].Success) { [int]$m.Groups[3].Value } else { 0 })
+}
+
+function Get-PssHttp([int]$Seconds) {
+    try { Add-Type -AssemblyName System.Net.Http -ErrorAction Stop } catch {}   # loads the framework assembly (no compiling)
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+    $h = New-Object System.Net.Http.HttpClient
+    $h.Timeout = [TimeSpan]::FromSeconds($Seconds)
+    $h.DefaultRequestHeaders.UserAgent.ParseAdd('pxdStartupScanner')
+    return $h
+}
+
+function Find-PssUpdate([Version]$Current) {
+    # @{ Version; Url; SumUrl } of a newer release, or $null (current, no matching asset, offline, GitHub slow)
+    $api = if ($env:PXD_UPDATE_API) { $env:PXD_UPDATE_API.TrimEnd('/') } else { 'https://api.github.com' }
+    $http = Get-PssHttp 4
+    try { $rel = $http.GetStringAsync("$api/repos/$($script:PssRepo)/releases/latest").GetAwaiter().GetResult() | ConvertFrom-Json } finally { $http.Dispose() }
+    $latest = Get-PssVersionOf $rel.tag_name
+    if (-not $latest -or $latest -le $Current) { return $null }
+    $asset = @($rel.assets | Where-Object { $_.name -match $script:PssAsset } | Select-Object -First 1)
+    if (-not $asset.Count) { return $null }
+    $sum = @($rel.assets | Where-Object { $_.name -eq ($asset[0].name + '.sha256') } | Select-Object -First 1)
+    return @{ Version = $latest; Url = [string]$asset[0].browser_download_url; SumUrl = $(if ($sum.Count) { [string]$sum[0].browser_download_url } else { $null }) }
+}
+
+function Invoke-PssRerun([string]$Path, [hashtable]$Params) { & $Path @Params }   # (a test replaces this)
+
+function Update-PssBeforeStart([Collections.IDictionary]$Params, [string]$SelfPath = $script:PssSelfPath) {
+    # True when a newer copy was installed and has run in place of this one (the caller then just returns)
+    try {
+        if (-not $SelfPath -or $script:PssInMemory -or $script:PssReadOnly -or $env:PXD_NO_UPDATE -eq '1' -or $env:PXD_UPDATED_FROM) { return $false }
+        if (-not (Test-Path -LiteralPath $SelfPath)) { return $false }
+        # only a file that really is this scanner (not a script that loaded it some other way)
+        if (-not ([IO.File]::ReadAllText($SelfPath)).Contains("`$script:PssVersion = '$($script:PssVersion)'")) { return $false }
+        $plan = Find-PssUpdate (Get-PssVersionOf $script:PssVersion)
+        if (-not $plan) { return $false }
+        Write-Host "  Updating pxd Startup Scanner $($script:PssVersion) -> $($plan.Version)..." -ForegroundColor DarkCyan
+        $http = Get-PssHttp 60
+        try {
+            $bytes = $http.GetByteArrayAsync($plan.Url).GetAwaiter().GetResult()
+            if ($plan.SumUrl) {
+                $want = [regex]::Match($http.GetStringAsync($plan.SumUrl).GetAwaiter().GetResult(), '[0-9a-fA-F]{64}').Value
+                $sha = [Security.Cryptography.SHA256]::Create()
+                try { $have = ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '') } finally { $sha.Dispose() }
+                if ($want.Length -eq 64 -and $want -ne $have) { Write-Host '  The download did not match its checksum; running this copy.' -ForegroundColor Yellow; return $false }
+            }
+        } finally { $http.Dispose() }
+        # Must be a whole, parseable copy of this scanner with the release's version, ASCII-only like this one
+        if ([regex]::IsMatch([Text.Encoding]::GetEncoding(28591).GetString($bytes), '[^\x00-\x7F]')) { return $false }
+        $text = [Text.Encoding]::ASCII.GetString($bytes)
+        $errs = $null; [void][System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$null, [ref]$errs)
+        if ($errs.Count -or -not $text.Contains('function Start-pxdStartupScanner') -or (Get-PssVersionOf ([regex]::Match($text, "PssVersion = '([^']+)'").Groups[1].Value)) -ne $plan.Version) { return $false }
+        # Swap the file (the old one is kept as .pxdold until the swap is done)
+        $new = $SelfPath + '.pxdnew'; $old = $SelfPath + '.pxdold'
+        [IO.File]::WriteAllBytes($new, $bytes)
+        try { [IO.File]::Replace($new, $SelfPath, $old); Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue }
+        catch { Remove-Item -LiteralPath $new -Force -ErrorAction SilentlyContinue; return $false }
+    } catch { return $false }
+    # Run the new copy with the same parameters (once: it won't check again)
+    $same = @{}; foreach ($k in @($Params.Keys)) { $same[$k] = $Params[$k] }
+    $env:PXD_UPDATED_FROM = $script:PssVersion
+    try { Invoke-PssRerun $SelfPath $same } finally { $env:PXD_UPDATED_FROM = $null }
+    return $true
+}
+
 function Start-pxdStartupScanner {
     param([switch]$Gui, [switch]$Report, [string]$Export, [switch]$ReadOnly)
     # Run the same way whatever the technician's profile sets (these only apply inside this call)
@@ -3811,6 +3887,8 @@ function Start-pxdStartupScanner {
     # In-memory mode (set by the pxd Toolkit console while it runs this script): nothing is saved on the PC by the
     # scanner itself (no settings, backups, migration, boot tests, taskbar id). Changes still work, without undo.
     $script:PssInMemory = $env:PXD_INMEMORY -eq '1'
+    # An installed copy updates itself before it runs (not in-memory, read-only or through irm | iex)
+    if (Update-PssBeforeStart $PSBoundParameters) { return }
     $script:PssEof = $false
     $script:PssShowMicrosoft = $false
     $script:PssOnlyEnabled = $false

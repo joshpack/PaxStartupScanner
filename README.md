@@ -36,6 +36,8 @@ $env:PSS_READONLY = '1'; irm https://raw.githubusercontent.com/joshpack/pxdStart
 
 **In-memory mode.** When the [pxd Toolkit](https://github.com/joshpack/pxdToolkit) console (`irm pxdtek.com/tk | iex`) runs the scanner, it sets `$env:PXD_INMEMORY = '1'`. The scanner then saves nothing on the PC by itself: no window settings, no backups, no boot tests, no taskbar id, and older versions' folders aren't moved. Disable and Delete still work, but each one asks first because it has no backup and can't be undone from here. Undo, restoring a full backup and boot tests are off. Reports and backups you save yourself are written only where you choose.
 
+**Updates itself.** A copy run from a file (for example one the pxd Toolkit installed) first checks the latest release, for at most a few seconds. If it's newer, the file is replaced and the new version runs with the same parameters. Through `irm | iex` it's already the latest, and in-memory and read-only runs never check. `$env:PXD_NO_UPDATE = '1'` turns it off.
+
 On older systems where PowerShell doesn't use TLS 1.2 by default (Server 2012 R2/2016, early Windows 10), use:
 
 ```powershell
