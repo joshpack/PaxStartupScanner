@@ -2122,7 +2122,7 @@ function Write-PssRule([string]$Title = '', [string]$Color = 'DarkCyan') {
 }
 
 # ---- PD header ---------------------------------------------------------------------------------------------------
-# The PD logo beside the tool's name, shown once when a pxdtek CLI tool starts. The master copy is cli/PdHeader.ps1
+# The pxd logo beside the tool's name, shown once when a pxdtek CLI tool starts. The master copy is cli/PdHeader.ps1
 # in the pxdtek repo; each tool carries a copy (they run through irm | iex, so they can't load it). Keep them in sync.
 # ASCII-only on purpose, so irm | iex never trips on encoding: the solid-block logo is stored as letters
 # (U = upper half block, D = lower half block, F = full block) and turned into blocks when it's shown.
@@ -2130,32 +2130,32 @@ function Write-PssRule([string]$Title = '', [string]$Color = 'DarkCyan') {
 function Show-PdHeader {
     param([string]$Name, [string]$Version = '', [string[]]$About = @(), [string]$Command = '')
     $ascii = @(
-        '      -++++++++++-'
-        '   :++-          -++:'
-        '  ++        +#-     ++'
-        ' #-         -+@%-    -#'
-        '++    =##*%#%=-=##.   ++'
-        '%    +%. .@:+%   *#    %'
-        '%    #*   %+:@. .%+    %'
-        '++   .##=-=%#%*##=    ++'
-        ' #-    -%@+-         -#'
-        '  ++     -#+        ++'
-        '   :++-          -++:'
-        '      -++++++++++-'
+        '        .:----:.'
+        '     ---:      =*--'
+        '   -=.         .@. =-'
+        '  +:         :+*@*  .+'
+        ' =:      .  #-. .@:  :='
+        ' *     +++#=#.  :@=   *'
+        ' *    %:  .#=#+++.    *'
+        ' =:   @. .-%  .      :='
+        '  +.  +@*+:         .+'
+        '   -=  @.          =-'
+        '     --*-      .---'
+        '        .:-----.'
     )
     $blocks = @(
-        '      DDDUUUUUUDDD'
-        '    DUU          UUD'
-        '  DU        UFD     UD'
-        ' FU         DDFFD    UF'
-        'DU    DFUUFFFU UUF    UD'
-        'F    DF   F UF   FF    F'
-        'F    FF   FD F   FU    F'
-        'UD    FDD DFFFDDFU    DU'
-        ' FD    UFFUU         DF'
-        '  UD     UFD        DU'
-        '    UDD          DDU'
-        '      UUUDDDDDDUUU'
+        '         DDDDDD'
+        '     DFUU      FFFD'
+        '   DU           F  UD'
+        '  FU         DDFFF  UF'
+        ' DU         FU   FD  UF'
+        ' F     DFUFDF   DFF   F'
+        ' F    FU   FUFDFU     F'
+        ' UD   F   DF         DF'
+        '  FD  FFFUU         DF'
+        '   UD  F           DU'
+        '     UFFF      DDFU'
+        '        UUUUUUUU'
     )
     $text = New-Object System.Collections.Generic.List[object]
     $text.Add(@($Name, 'White'))
