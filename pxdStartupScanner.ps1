@@ -13,7 +13,7 @@
         irm pxdtek.com/ss | iex
 
     (pxdtek.com serves the latest copy of
-        https://raw.githubusercontent.com/joshpack/pxdStartupScanner/main/pxdStartupScanner.ps1)
+        https://raw.githubusercontent.com/pxdtek/pxdStartupScanner/HEAD/pxdStartupScanner.ps1)
 
     Scans: Run/RunOnce keys (machine + every loaded user), startup folders (all profiles),
     scheduled tasks, auto-start services and drivers, Winlogon, Explorer hooks, AppInit DLLs,
@@ -39,9 +39,10 @@ param(
     [switch]$ReadOnly
 )
 
-$script:PssVersion = '1.6.1'
+$script:PssVersion = '1.6.2'
 $script:PssAppId   = 'pxdStartupScanner'
-$script:PssUrl     = 'https://raw.githubusercontent.com/joshpack/pxdStartupScanner/main/pxdStartupScanner.ps1'
+$script:PssUrl     = 'https://pxdtek.com/raw/pxdStartupScanner/pxdStartupScanner.ps1'
+$script:PssGitHubUrl = 'https://raw.githubusercontent.com/pxdtek/pxdStartupScanner/HEAD/pxdStartupScanner.ps1'   # fallback
 $script:PssSelfPath = $PSCommandPath   # empty when run through irm | iex
 
 # ======================================================================================
@@ -3091,7 +3092,10 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
     # -Snapshot <png>: render the window off-screen to an image instead of showing it (self-test, README screenshots)
     if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
         Write-Host '   The GUI needs an STA thread. Opening it in Windows PowerShell...' -ForegroundColor Yellow
-        if ($script:PssSelfPath) { $cmd = "& '$($script:PssSelfPath)' -Gui" } else { $cmd = "& ([scriptblock]::Create((irm '$($script:PssUrl)'))) -Gui" }
+        if ($script:PssSelfPath) { $cmd = "& '$($script:PssSelfPath)' -Gui" } else {
+            # pxdtek.com first, GitHub if that fails or answers with anything but this script (a web filter's block page is never run)
+            $cmd = '$s = try {{ irm ''{0}'' -ErrorAction Stop }} catch {{ '''' }}; if ($s -notmatch ''function Start-pxdStartupScanner'') {{ $s = irm ''{1}'' }}; if ($s -match ''function Start-pxdStartupScanner'') {{ & ([scriptblock]::Create($s)) -Gui }}' -f $script:PssUrl, $script:PssGitHubUrl
+        }
         Start-Process powershell.exe -ArgumentList '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-Command', $cmd
         return $Scan
     }
@@ -3802,11 +3806,14 @@ function Show-PssGui($Scan, [string]$Snapshot, [int]$SnapshotTab = 0) {
 # ======================================================================================
 
 # ---- Update before start (pxd standard rule 6) ------------------------------------------------------------------------
-# A copy run from a file (installed by the pxd Toolkit) checks the latest GitHub release first; when it's newer, the file
-# is replaced and the new copy runs with the same parameters. Through irm | iex the script is already the latest, and
-# in-memory or read-only mode writes nothing, so those don't check. PXD_NO_UPDATE=1 turns it off; PXD_UPDATE_API points
-# at another API server (tests). Never stops the scanner from starting: any problem just runs this copy.
-$script:PssRepo = 'joshpack/pxdStartupScanner'
+# A copy run from a file (installed by the pxd Toolkit) checks the latest release first; when it's newer, the file is
+# replaced and the new copy runs with the same parameters. Through irm | iex the script is already the latest, and
+# in-memory or read-only mode writes nothing, so those don't check. PXD_NO_UPDATE=1 turns it off.
+# Where from: pxdtek.com first (it fetches from GitHub on its side), GitHub only when pxdtek.com fails, is slow or answers
+# with HTML (a web filter's block page). A block page is never taken for the release, the script or its checksum.
+# PXD_UPDATE_API replaces both API addresses (tests; several separated by ';'). Never stops the scanner from starting:
+# any problem just runs this copy.
+$script:PssRepo = 'pxdtek/pxdStartupScanner'
 $script:PssAsset = '^pxdStartupScanner\.ps1$'
 
 function Get-PssVersionOf([string]$Text) {
@@ -3824,17 +3831,86 @@ function Get-PssHttp([int]$Seconds) {
     return $h
 }
 
+function Get-PssApiBases {
+    if ($env:PXD_UPDATE_API) { return @($env:PXD_UPDATE_API -split ';' | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('/') }) }
+    return @('https://pxdtek.com/gh', 'https://api.github.com')
+}
+
+function Get-PssGitHubCopy([string]$Url) {
+    # pxdtek.com's copy of a release download -> the same file on GitHub (the fallback); $null for any other address
+    $m = [regex]::Match([string]$Url, '^https://pxdtek\.com/dl/([^/]+)/([^/]+)/([^/]+)$')
+    if ($m.Success) { return "https://github.com/pxdtek/$($m.Groups[1].Value)/releases/download/$($m.Groups[2].Value)/$($m.Groups[3].Value)" }
+    return $null
+}
+
+function Test-PssHtml([byte[]]$Bytes) {
+    # A web filter's block page (or any other web page) instead of the file asked for
+    if (-not $Bytes -or -not $Bytes.Length) { return $true }
+    $head = [Text.Encoding]::GetEncoding(28591).GetString($Bytes, 0, [Math]::Min(1024, $Bytes.Length)).TrimStart([char]0xEF, [char]0xBB, [char]0xBF, ' ', "`t", "`r", "`n")
+    # real HTML only: a PowerShell script may well start with a '<#' help comment
+    return ($head -match '(?i)^\s*<\s*(!doctype|html|head|body|meta|title|script|div|\?xml)\b')
+}
+
+function Get-PssBytes($Http, [string]$Url) {
+    # The file's bytes, or $null when the address failed or answered with a web page
+    try { $b = $Http.GetByteArrayAsync($Url).GetAwaiter().GetResult() } catch { return $null }
+    if (Test-PssHtml $b) { return $null }
+    return , $b
+}
+
 function Find-PssUpdate([Version]$Current) {
-    # @{ Version; Url; SumUrl } of a newer release, or $null (current, no matching asset, offline, GitHub slow)
-    $api = if ($env:PXD_UPDATE_API) { $env:PXD_UPDATE_API.TrimEnd('/') } else { 'https://api.github.com' }
+    # @{ Version; Url; SumUrl } of a newer release, or $null (current, no matching asset, offline, everything blocked)
     $http = Get-PssHttp 4
-    try { $rel = $http.GetStringAsync("$api/repos/$($script:PssRepo)/releases/latest").GetAwaiter().GetResult() | ConvertFrom-Json } finally { $http.Dispose() }
+    $rel = $null
+    try {
+        foreach ($api in (Get-PssApiBases)) {
+            $b = Get-PssBytes $http "$api/repos/$($script:PssRepo)/releases/latest"
+            if (-not $b) { continue }
+            try { $j = [Text.Encoding]::UTF8.GetString($b) | ConvertFrom-Json -ErrorAction Stop } catch { continue }   # not JSON: next source
+            if ($j -and $j.tag_name -and $null -ne $j.assets) { $rel = $j; break }
+        }
+    } finally { $http.Dispose() }
+    if (-not $rel) { return $null }
     $latest = Get-PssVersionOf $rel.tag_name
     if (-not $latest -or $latest -le $Current) { return $null }
     $asset = @($rel.assets | Where-Object { $_.name -match $script:PssAsset } | Select-Object -First 1)
     if (-not $asset.Count) { return $null }
     $sum = @($rel.assets | Where-Object { $_.name -eq ($asset[0].name + '.sha256') } | Select-Object -First 1)
     return @{ Version = $latest; Url = [string]$asset[0].browser_download_url; SumUrl = $(if ($sum.Count) { [string]$sum[0].browser_download_url } else { $null }) }
+}
+
+function Get-PssReleaseScript($Plan) {
+    # The new script's bytes from the first source that gives a whole, checked copy (pxdtek.com, then GitHub); else $null
+    $http = Get-PssHttp 60
+    try {
+        $want = $null
+        if ($Plan.SumUrl) {
+            foreach ($u in @($Plan.SumUrl, (Get-PssGitHubCopy $Plan.SumUrl)) | Where-Object { $_ }) {
+                $b = Get-PssBytes $http $u
+                if (-not $b) { continue }
+                $m = [regex]::Match([Text.Encoding]::ASCII.GetString($b), '\b[0-9a-fA-F]{64}\b')
+                if ($m.Success) { $want = $m.Value.ToUpperInvariant(); break }
+            }
+            if (-not $want) { return $null }   # the release has a checksum but none could be read: don't trust the file
+        }
+        foreach ($u in @($Plan.Url, (Get-PssGitHubCopy $Plan.Url)) | Where-Object { $_ }) {
+            $bytes = Get-PssBytes $http $u
+            if (-not $bytes) { continue }
+            if ($want) {
+                $sha = [Security.Cryptography.SHA256]::Create()
+                try { $have = ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '') } finally { $sha.Dispose() }
+                if ($have -ne $want) { continue }
+            }
+            # Must be a whole, parseable copy of this scanner with the release's version, ASCII-only like this one
+            if ([regex]::IsMatch([Text.Encoding]::GetEncoding(28591).GetString($bytes), '[^\x00-\x7F]')) { continue }
+            $text = [Text.Encoding]::ASCII.GetString($bytes)
+            $errs = $null; [void][System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$null, [ref]$errs)
+            if ($errs.Count -or -not $text.Contains('function Start-pxdStartupScanner')) { continue }
+            if ((Get-PssVersionOf ([regex]::Match($text, "PssVersion = '([^']+)'").Groups[1].Value)) -ne $Plan.Version) { continue }
+            return , $bytes
+        }
+        return $null
+    } finally { $http.Dispose() }
 }
 
 function Invoke-PssRerun([string]$Path, [hashtable]$Params) { & $Path @Params }   # (a test replaces this)
@@ -3849,21 +3925,8 @@ function Update-PssBeforeStart([Collections.IDictionary]$Params, [string]$SelfPa
         $plan = Find-PssUpdate (Get-PssVersionOf $script:PssVersion)
         if (-not $plan) { return $false }
         Write-Host "  Updating pxd Startup Scanner $($script:PssVersion) -> $($plan.Version)..." -ForegroundColor DarkCyan
-        $http = Get-PssHttp 60
-        try {
-            $bytes = $http.GetByteArrayAsync($plan.Url).GetAwaiter().GetResult()
-            if ($plan.SumUrl) {
-                $want = [regex]::Match($http.GetStringAsync($plan.SumUrl).GetAwaiter().GetResult(), '[0-9a-fA-F]{64}').Value
-                $sha = [Security.Cryptography.SHA256]::Create()
-                try { $have = ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '') } finally { $sha.Dispose() }
-                if ($want.Length -eq 64 -and $want -ne $have) { Write-Host '  The download did not match its checksum; running this copy.' -ForegroundColor Yellow; return $false }
-            }
-        } finally { $http.Dispose() }
-        # Must be a whole, parseable copy of this scanner with the release's version, ASCII-only like this one
-        if ([regex]::IsMatch([Text.Encoding]::GetEncoding(28591).GetString($bytes), '[^\x00-\x7F]')) { return $false }
-        $text = [Text.Encoding]::ASCII.GetString($bytes)
-        $errs = $null; [void][System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$null, [ref]$errs)
-        if ($errs.Count -or -not $text.Contains('function Start-pxdStartupScanner') -or (Get-PssVersionOf ([regex]::Match($text, "PssVersion = '([^']+)'").Groups[1].Value)) -ne $plan.Version) { return $false }
+        $bytes = Get-PssReleaseScript $plan
+        if (-not $bytes) { Write-Host '  The update could not be downloaded and checked; running this copy.' -ForegroundColor Yellow; return $false }
         # Swap the file (the old one is kept as .pxdold until the swap is done)
         $new = $SelfPath + '.pxdnew'; $old = $SelfPath + '.pxdold'
         [IO.File]::WriteAllBytes($new, $bytes)
