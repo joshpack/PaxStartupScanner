@@ -2122,41 +2122,85 @@ function Write-PssRule([string]$Title = '', [string]$Color = 'DarkCyan') {
 }
 
 # ---- PD header ---------------------------------------------------------------------------------------------------
-# The pxd logo beside the tool's name, shown once when a pxdtek CLI tool starts. The master copy is cli/PdHeader.ps1
-# in the pxdtek repo; each tool carries a copy (they run through irm | iex, so they can't load it). Keep them in sync.
-# ASCII-only on purpose, so irm | iex never trips on encoding: the solid-block logo is stored as letters
-# (U = upper half block, D = lower half block, F = full block) and turned into blocks when it's shown.
-# Each run picks one of the two logos at random; a window too narrow for the logo gets a one-line header.
+# The pxd logo beside the tool's name, shown when a pxdtek CLI tool starts. The master copy is cli/PdHeader.ps1 in the
+# pxdtek repo; each tool carries a copy (they run through irm | iex, so they can't load it). tools/sync-header.ps1
+# copies it into them.
+# Ten drawings of the logo, from tools/pdlogos.mjs: solid blocks, braille dots, shades and plain ASCII, tilted like the
+# logo or upright, the pxd in white and the ring in cyan. They're stored as gzip + base64 so this stays ASCII and
+# irm | iex never trips on encoding. Each time, one is picked at random from those that fit the window (braille only
+# in Windows Terminal or VS Code, whose fonts have the dots); a window too narrow for any gets a one-line header.
+# Nothing is kept between runs: under irm | iex the script scope is the caller's own session.
+
+# A random logo no wider than $Room (@{ Style; Width; Text = lines; Color = lines }), or $null if none fits.
+function Get-PdLogo([int]$Room = [int]::MaxValue) {
+    $logos = @(
+        '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'
+    ) -join ''
+    $all = @()
+    try {
+        $gz = New-Object IO.Compression.GZipStream((New-Object IO.MemoryStream(, [Convert]::FromBase64String($logos))), ([IO.Compression.CompressionMode]::Decompress))
+        $body = (New-Object IO.StreamReader($gz, [Text.Encoding]::UTF8)).ReadToEnd()
+        foreach ($chunk in ($body -split "`n~`n")) {
+            $l = $chunk -split "`n"
+            $head = $l[0] -split ' '
+            $n = [int]$head[2]
+            $all += @{ Style = $head[0]; Width = [int]$head[1]; Text = $l[1..$n]; Color = $l[($n + 1)..(2 * $n)] }
+        }
+    } catch { return $null }
+    $dots = [bool]($env:WT_SESSION -or $env:TERM_PROGRAM -eq 'vscode')
+    $fit = @($all | Where-Object { ($dots -or $_.Style -ne 'd') -and $_.Width -le $Room })
+    if (-not $fit.Count) { return $null }
+    $fit[(Get-Random -Maximum $fit.Count)]
+}
+
+# Line $Row of a logo in its colours (W the pxd, C the ring, D its faint edge), no newline; -Pad fills it to the
+# logo's width. A row past the logo's end writes only the padding.
+function Write-PdLogoLine($Logo, [int]$Row, [switch]$Pad) {
+    $line = ''; $mask = ''
+    if ($Row -ge 0 -and $Row -lt $Logo.Text.Count) { $line = [string]$Logo.Text[$Row]; $mask = [string]$Logo.Color[$Row] }
+    $colors = @{ 'W' = 'White'; 'C' = 'Cyan'; 'D' = 'DarkCyan' }
+    # one colour run at a time; spaces join whichever run they're in
+    $run = ''; $col = 'Cyan'
+    for ($k = 0; $k -lt $line.Length; $k++) {
+        $c = $col
+        if ($line[$k] -ne ' ' -and $k -lt $mask.Length -and $colors.ContainsKey([string]$mask[$k])) { $c = $colors[[string]$mask[$k]] }
+        if ($c -ne $col -and $run) { Write-Host $run -NoNewline -ForegroundColor $col; $run = '' }
+        $col = $c; $run += $line[$k]
+    }
+    if ($run) { Write-Host $run -NoNewline -ForegroundColor $col }
+    if ($Pad -and $line.Length -lt $Logo.Width) { Write-Host (' ' * ($Logo.Width - $line.Length)) -NoNewline }
+}
+
 function Show-PdHeader {
     param([string]$Name, [string]$Version = '', [string[]]$About = @(), [string]$Command = '')
-    $ascii = @(
-        '        .:----:.'
-        '     ---:      =*--'
-        '   -=.         .@. =-'
-        '  +:         :+*@*  .+'
-        ' =:      .  #-. .@:  :='
-        ' *     +++#=#.  :@=   *'
-        ' *    %:  .#=#+++.    *'
-        ' =:   @. .-%  .      :='
-        '  +.  +@*+:         .+'
-        '   -=  @.          =-'
-        '     --*-      .---'
-        '        .:-----.'
-    )
-    $blocks = @(
-        '         DDDDDD'
-        '     DFUU      FFFD'
-        '   DU           F  UD'
-        '  FU         DDFFF  UF'
-        ' DU         FU   FD  UF'
-        ' F     DFUFDF   DFF   F'
-        ' F    FU   FUFDFU     F'
-        ' UD   F   DF         DF'
-        '  FD  FFFUU         DF'
-        '   UD  F           DU'
-        '     UFFF      DDFU'
-        '        UUUUUUUU'
-    )
     $text = New-Object System.Collections.Generic.List[object]
     $text.Add(@($Name, 'White'))
     $text.Add(@(((@($Version, 'pxdtek.com') | Where-Object { $_ }) -join '  -  '), 'DarkGray'))
@@ -2166,35 +2210,24 @@ function Show-PdHeader {
 
     $w = 0
     try { $w = $Host.UI.RawUI.WindowSize.Width } catch {}
+    $logo = Get-PdLogo $(if ($w -gt 0) { $w - $textWidth - 7 } else { [int]::MaxValue })
+
     Write-Host ''
-    if ($w -gt 0 -and $w -lt 30 + $textWidth) {
+    if (-not $logo) {
         Write-Host '  (pd) ' -NoNewline -ForegroundColor Cyan
         Write-Host $Name -NoNewline -ForegroundColor White
         Write-Host $(if ($Version) { "  $Version" } else { '' }) -ForegroundColor DarkGray
         Write-Host ''
         return
     }
-
-    if ($null -eq (Get-Variable -Name PdHeaderStyle -Scope Script -ValueOnly -ErrorAction SilentlyContinue)) { $script:PdHeaderStyle = Get-Random -Minimum 0 -Maximum 2 }
-    $useBlocks = $script:PdHeaderStyle -eq 1
-    $top = [Math]::Max(0, [Math]::Floor(($ascii.Count - $text.Count) / 2))
-    for ($i = 0; $i -lt $ascii.Count; $i++) {
-        Write-Host '  ' -NoNewline
-        if ($useBlocks) {
-            $l = $blocks[$i].Replace('U', [string][char]0x2580).Replace('D', [string][char]0x2584).Replace('F', [string][char]0x2588)
-            Write-Host $l.PadRight(24) -NoNewline -ForegroundColor Cyan
-        } else {
-            # dense strokes white, the middle cyan, the edges dark cyan: one colour run at a time
-            $run = ''; $col = ''
-            foreach ($c in $ascii[$i].PadRight(24).ToCharArray()) {
-                $k = if ('@%#'.Contains([string]$c)) { 'White' } elseif ('*+='.Contains([string]$c)) { 'Cyan' } else { 'DarkCyan' }
-                if ($k -ne $col -and $run) { Write-Host $run -NoNewline -ForegroundColor $col; $run = '' }
-                $col = $k; $run += $c
-            }
-            if ($run) { Write-Host $run -NoNewline -ForegroundColor $col }
-        }
+    $rows = $logo.Text.Count
+    $top = [Math]::Max(0, [Math]::Floor(($rows - $text.Count) / 2))
+    for ($i = 0; $i -lt [Math]::Max($rows, $top + $text.Count); $i++) {
         $j = $i - $top
-        if ($j -ge 0 -and $j -lt $text.Count -and $text[$j][0]) { Write-Host ('    ' + $text[$j][0]) -NoNewline -ForegroundColor $text[$j][1] }
+        $say = $j -ge 0 -and $j -lt $text.Count -and $text[$j][0]
+        Write-Host '  ' -NoNewline
+        Write-PdLogoLine $logo $i -Pad:$say
+        if ($say) { Write-Host ('    ' + $text[$j][0]) -NoNewline -ForegroundColor $text[$j][1] }
         Write-Host ''
     }
     Write-Host ''
